@@ -1,0 +1,18 @@
+# Dart
+.dart_tool/
+.packages
+build/
+pubspec.lock
+
+# Compiled binary
+flutter_devtools_mcp
+flutter_devtools_mcp.exe
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
