@@ -10,7 +10,7 @@ class CpuAnalyzer {
           (a, b) => (b.exclusiveTicks ?? 0).compareTo(a.exclusiveTicks ?? 0));
 
     final user =
-        sorted.where((f) => !_isVmInternal(f.function?.name ?? '')).take(topN).toList();
+        sorted.where((f) => !_isVmInternal(_functionName(f))).take(topN).toList();
 
     final windowSec =
         ((samples.timeExtentMicros ?? 0) / 1e6).toStringAsFixed(1);
@@ -37,11 +37,32 @@ class CpuAnalyzer {
   String _formatName(ProfileFunction f) {
     final fn = f.function;
     if (fn == null) return 'unknown';
-    final owner = fn.owner;
-    if (owner?.name != null && owner!.name!.isNotEmpty) {
-      return '${owner.name}.${fn.name}';
+
+    // vm_service returns function as dynamic — may be typed obj or raw Map
+    if (fn is Map) {
+      final name = fn['name'] as String? ?? 'unknown';
+      final owner = fn['owner'];
+      final ownerName = owner is Map ? owner['name'] as String? : null;
+      if (ownerName != null && ownerName.isNotEmpty) return '$ownerName.$name';
+      return name;
     }
-    return fn.name ?? 'unknown';
+
+    // Typed FuncRef / ObjRef path
+    try {
+      final ownerName = (fn as dynamic).owner?.name as String?;
+      final fnName = (fn as dynamic).name as String? ?? 'unknown';
+      if (ownerName != null && ownerName.isNotEmpty) return '$ownerName.$fnName';
+      return fnName;
+    } catch (_) {
+      return fn.toString();
+    }
+  }
+
+  String _functionName(ProfileFunction f) {
+    final fn = f.function;
+    if (fn == null) return '';
+    if (fn is Map) return fn['name'] as String? ?? '';
+    try { return (fn as dynamic).name as String? ?? ''; } catch (_) { return ''; }
   }
 
   bool _isVmInternal(String name) =>
