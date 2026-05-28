@@ -4,22 +4,45 @@ import 'package:vm_service/vm_service.dart';
 class RebuildCollector {
   final Map<String, int> _counts = {};
   StreamSubscription<Event>? _sub;
+  bool _gotEvents = false;
 
   void start(VmService service) {
     service.streamListen(EventStreams.kExtension).catchError((_) => Success());
     _sub = service.onExtensionEvent.listen((event) {
-      if (event.extensionKind == 'Flutter.RebuiltWidgets') {
-        final data = event.extensionData?.data;
+      // Flutter emits this under multiple possible kinds depending on version
+      if (event.extensionKind == 'Flutter.RebuiltWidgets' ||
+          event.extensionKind == 'Flutter.RepaintWidgets' ||
+          event.extensionKind == 'Flutter.RebuildDirtyWidgets') {
+        final data = event.extensionData?.data ?? event.json;
         if (data == null) return;
-        final widgets = data['widgets'] as List<dynamic>? ?? [];
-        for (final w in widgets) {
-          final name = w['widget'] as String? ?? 'Unknown';
-          final count = (w['count'] as num?)?.toInt() ?? 1;
-          _counts[name] = (_counts[name] ?? 0) + count;
+        _gotEvents = true;
+
+        // Try top-level 'widgets' array
+        final widgets = data['widgets'] as List<dynamic>?;
+        if (widgets != null) {
+          for (final w in widgets) {
+            if (w is! Map) continue;
+            final name = w['widget']?.toString() ??
+                w['name']?.toString() ??
+                'Unknown';
+            final count = (w['count'] as num?)?.toInt() ?? 1;
+            _counts[name] = (_counts[name] ?? 0) + count;
+          }
+        }
+
+        // Some versions emit map of name→count directly
+        final counts = data['counts'] as Map<String, dynamic>?;
+        if (counts != null) {
+          _gotEvents = true;
+          counts.forEach((k, v) {
+            _counts[k] = (_counts[k] ?? 0) + ((v as num?)?.toInt() ?? 1);
+          });
         }
       }
     });
   }
+
+  bool get gotEvents => _gotEvents;
 
   Future<String> stopAndReport() async {
     await _sub?.cancel();
@@ -27,7 +50,8 @@ class RebuildCollector {
 
     if (_counts.isEmpty) {
       return 'No rebuild events captured. '
-          'Interact with the app during the recording window.';
+          'Interact with the app during the recording window.\n'
+          'Note: rebuild tracking requires debug mode and flutter inspector active.';
     }
 
     final sorted = _counts.entries.toList()
@@ -53,8 +77,7 @@ class RebuildCollector {
       sb.writeln('Fixes for excessive rebuilds:');
       sb.writeln('  • Wrap stable subtrees with const constructors');
       sb.writeln('  • Add RepaintBoundary around independently-updating widgets');
-      sb.writeln(
-          '  • Use BlocSelector / select() to narrow rebuild scope');
+      sb.writeln('  • Use BlocSelector / select() to narrow rebuild scope');
       sb.writeln('  • Move state lower in tree to avoid rebuilding parents');
     }
 

@@ -18,6 +18,23 @@ class FrameData {
 }
 
 class JankAnalyzer {
+  // UI thread — top-level frame bracket ([Dart] category)
+  static const _uiFrameNames = {
+    'Frame',           // [Dart] Frame — confirmed on Impeller/iOS
+    'vsync callback',
+    'VsyncProcessCallback',
+    'Animator::BeginFrame', // [Embedder]
+  };
+
+  // Raster thread event names
+  static const _rasterFrameNames = {
+    'GPURasterizer::Draw',  // confirmed: [Embedder] GPURasterizer::Draw
+    'GPURasterizer::DoDraw',
+    'CompositorContext::ScopedFrame::Raster', // confirmed: [Embedder]
+    'LayerTree::Paint',     // confirmed: [Embedder]
+    'Rasterize',
+  };
+
   List<FrameData> parseFrames(Timeline timeline) {
     final events = timeline.traceEvents ?? [];
     final Map<String, int> uiBegin = {};
@@ -31,14 +48,23 @@ class JankAnalyzer {
       final ph = raw['ph'] as String? ?? '';
       final ts = (raw['ts'] as num?)?.toInt() ?? 0;
       final tid = raw['tid'].toString();
+      final cat = raw['cat'] as String? ?? '';
 
-      // UI thread frame markers
-      if (name == 'Frame' || name == 'vsync callback') {
+      // [Dart] Frame is the confirmed top-level UI frame bracket on Impeller/iOS
+      // [Embedder] GPURasterizer::Draw / CompositorContext::ScopedFrame::Raster for raster
+      final isUiEvent = _uiFrameNames.contains(name) ||
+          (cat == 'Dart' && name == 'Frame');
+      final isRasterEvent = _rasterFrameNames.contains(name) ||
+          (cat == 'Embedder' && (name == 'GPURasterizer::Draw' ||
+              name == 'CompositorContext::ScopedFrame::Raster' ||
+              name == 'LayerTree::Paint'));
+
+      if (isUiEvent) {
         if (ph == 'B') {
           uiBegin[tid] = ts;
         } else if (ph == 'E') {
           final begin = uiBegin[tid];
-          if (begin != null) {
+          if (begin != null && ts > begin) {
             frames.add(FrameData(
               frameNumber: frames.length + 1,
               uiDurationMicros: ts - begin,
@@ -47,16 +73,26 @@ class JankAnalyzer {
             ));
             uiBegin.remove(tid);
           }
+        } else if (ph == 'X') {
+          // Complete event — has dur field
+          final dur = (raw['dur'] as num?)?.toInt() ?? 0;
+          if (dur > 0) {
+            frames.add(FrameData(
+              frameNumber: frames.length + 1,
+              uiDurationMicros: dur,
+              rasterDurationMicros: 0,
+              totalDurationMicros: dur,
+            ));
+          }
         }
       }
 
-      // Raster thread — try to update last frame's raster time
-      if ((name == 'GPURasterizer::DoDraw' || name == 'Rasterize') && frames.isNotEmpty) {
+      if (isRasterEvent && frames.isNotEmpty) {
         if (ph == 'B') {
           rasterBegin[tid] = ts;
         } else if (ph == 'E') {
           final begin = rasterBegin[tid];
-          if (begin != null) {
+          if (begin != null && ts > begin) {
             final dur = ts - begin;
             final last = frames.last;
             frames[frames.length - 1] = FrameData(
@@ -68,11 +104,34 @@ class JankAnalyzer {
             );
             rasterBegin.remove(tid);
           }
+        } else if (ph == 'X') {
+          final dur = (raw['dur'] as num?)?.toInt() ?? 0;
+          if (dur > 0 && frames.isNotEmpty) {
+            final last = frames.last;
+            frames[frames.length - 1] = FrameData(
+              frameNumber: last.frameNumber,
+              uiDurationMicros: last.uiDurationMicros,
+              rasterDurationMicros: dur,
+              totalDurationMicros:
+                  last.uiDurationMicros > dur ? last.uiDurationMicros : dur,
+            );
+          }
         }
       }
     }
 
     return frames;
+  }
+
+  /// Debug: return all unique event names seen — helps diagnose missing frames
+  List<String> debugEventNames(Timeline timeline) {
+    final names = <String>{};
+    for (final e in timeline.traceEvents ?? []) {
+      final name = e.json?['name'] as String?;
+      final cat = e.json?['cat'] as String?;
+      if (name != null) names.add('[$cat] $name');
+    }
+    return names.toList()..sort();
   }
 
   String generateReport(List<FrameData> frames, {int targetFps = 60}) {

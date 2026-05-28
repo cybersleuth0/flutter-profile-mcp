@@ -465,6 +465,22 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       ),
       _handleAppInfo,
     );
+
+    registerTool(
+      Tool(
+        name: 'debug_frame_events',
+        description:
+            'Diagnostic tool: record timeline for N seconds and return all unique event names seen. '
+            'Use this if capture_frame_timing returns no data — it shows what the engine actually emits.',
+        inputSchema: ObjectSchema(
+          properties: {
+            'duration_seconds':
+                NumberSchema(description: 'Recording window (default: 3)'),
+          },
+        ),
+      ),
+      _handleDebugFrameEvents,
+    );
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -519,12 +535,26 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 3;
       final fps = (req.arguments?['target_fps'] as num?)?.toInt() ?? 60;
 
-      await _service!.setVMTimelineFlags(['Embedder', 'Dart', 'GC']);
+      // All flags: Embedder covers Flutter engine, API covers user code markers
+      await _service!.setVMTimelineFlags(['Embedder', 'Dart', 'GC', 'API']);
       await _service!.clearVMTimeline();
       await Future.delayed(Duration(seconds: dur));
       final timeline = await _service!.getVMTimeline();
 
       final frames = _jank.parseFrames(timeline);
+      if (frames.isEmpty) {
+        // Fallback: report raw event count so user knows data was captured
+        final eventCount = timeline.traceEvents?.length ?? 0;
+        if (eventCount > 0) {
+          final names = _jank.debugEventNames(timeline).take(20).join('\n  ');
+          return _ok(
+              'Timeline captured $eventCount events but no frame markers matched.\n'
+              'Run debug_frame_events to see what the engine emits.\n\n'
+              'Sample event names:\n  $names');
+        }
+        return _ok(
+            'No timeline events captured. Interact with the app during the ${dur}s window.');
+      }
       return _ok(_jank.generateReport(frames, targetFps: fps));
     } catch (e) {
       return _err(e);
@@ -1591,6 +1621,37 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
           sb.writeln('  ... and ${extensions.length - 30} more');
         }
       }
+
+      return _ok(sb.toString());
+    } catch (e) {
+      return _err(e);
+    }
+  }
+
+  Future<CallToolResult> _handleDebugFrameEvents(CallToolRequest req) async {
+    if (_service == null) return _notConnected();
+    try {
+      final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 3;
+
+      await _service!.setVMTimelineFlags(['Embedder', 'Dart', 'GC', 'API']);
+      await _service!.clearVMTimeline();
+      await Future.delayed(Duration(seconds: dur));
+      final timeline = await _service!.getVMTimeline();
+
+      final total = timeline.traceEvents?.length ?? 0;
+      if (total == 0) {
+        return _ok('No timeline events captured in ${dur}s. App may be idle.');
+      }
+
+      final names = _jank.debugEventNames(timeline);
+      final sb = StringBuffer();
+      sb.writeln('Timeline: $total events in ${dur}s');
+      sb.writeln('Unique event names (${names.length}):');
+      sb.writeln('━' * 55);
+      for (final n in names.take(60)) {
+        sb.writeln('  $n');
+      }
+      if (names.length > 60) sb.writeln('  ... and ${names.length - 60} more');
 
       return _ok(sb.toString());
     } catch (e) {
