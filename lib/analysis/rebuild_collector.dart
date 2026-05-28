@@ -17,6 +17,12 @@ class RebuildCollector {
   final Map<String, int> _animationWidgets = {};
   StreamSubscription<Event>? _sub;
 
+  /// Pre-populate id→name from ext.flutter.inspector.widgetLocationIdMap
+  /// Must call before start() so reconnect sessions have names from first event.
+  void preloadLocationMap(dynamic locationMap) {
+    _parseLocations(locationMap);
+  }
+
   void start(VmService service) {
     service.streamListen(EventStreams.kExtension).catchError((_) => Success());
 

@@ -602,7 +602,17 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
       final collector = RebuildCollector();
 
-      // Start listening BEFORE enabling — first event includes locations map
+      // Pre-populate id→name cache from full location map (handles reconnects
+      // where Flutter won't resend locations for already-registered ids)
+      try {
+        final locResult = await _service!.callServiceExtension(
+          'ext.flutter.inspector.widgetLocationIdMap',
+          isolateId: _isolateId,
+        );
+        collector.preloadLocationMap(locResult.json?['result']);
+      } catch (_) {}
+
+      // Start listening BEFORE enabling — first event also includes locations
       collector.start(_service!);
       await _service!.callServiceExtension(
         'ext.flutter.inspector.trackRebuildDirtyWidgets',
