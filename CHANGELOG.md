@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.3
+
+- Fix README title (flutter_devtools_mcp → flutter_profile_mcp)
+
 ## 1.0.2
 
 - Update README: add pub.dev install method, simplify MCP config

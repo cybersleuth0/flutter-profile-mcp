@@ -1,4 +1,4 @@
-# flutter_devtools_mcp
+# flutter_profile_mcp
 
 > An MCP (Model Context Protocol) server that connects to a running Flutter app via `vm_service` and exposes 27 performance, memory, and debugging tools as AI-queryable actions.
 
