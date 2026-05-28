@@ -6,7 +6,7 @@ void main() async {
   final server = FlutterDevToolsMCPServer(
     channel: stdioChannel(input: stdin, output: stdout),
   );
-  stderr.writeln('[flutter_devtools_mcp] ready');
+  stderr.writeln('[flutter_profile_mcp] ready');
   await server.done;
   exit(0);
 }
