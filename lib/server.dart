@@ -661,9 +661,10 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
 
   Future<CallToolResult> _handleJankDiagnosis(CallToolRequest req) async {
     if (_service == null || _isolateId == null) return _notConnected();
-    final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
-    final half = dur ~/ 2 == 0 ? 1 : dur ~/ 2;
+    final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 6;
+    final half = (dur / 2).ceil().clamp(2, 30);
 
+    // Runs sequentially: half seconds for frames, then half for CPU = dur total
     final frameResult = await _handleFrameTiming(
       CallToolRequest(name: 'capture_frame_timing', arguments: {
         'duration_seconds': half,
@@ -682,7 +683,10 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
 
     // Synthesize verdict from both reports
     final verdict = _synthesizeVerdict(frameTxt, cpuTxt);
-    return _ok('$verdict\n\n━━ FRAME ANALYSIS ━━\n$frameTxt\n\n━━ CPU PROFILE ━━\n$cpuTxt');
+    return _ok('$verdict\n'
+        '(Recorded ${half}s frames + ${half}s CPU = ${half * 2}s total)\n\n'
+        '━━ FRAME ANALYSIS ━━\n$frameTxt\n\n'
+        '━━ CPU PROFILE ━━\n$cpuTxt');
   }
 
   String _synthesizeVerdict(String frameTxt, String cpuTxt) {

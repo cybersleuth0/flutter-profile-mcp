@@ -143,6 +143,37 @@ class RebuildCollector {
           '  ${e.key.padRight(42)} ${e.value.toString().padLeft(5)} rebuilds$flag');
     }
 
+    // Shared-parent detection: widgets with identical counts likely share a parent
+    final countGroups = <int, List<String>>{};
+    for (final e in sorted.take(20)) {
+      countGroups.putIfAbsent(e.value, () => []).add(e.key);
+    }
+    final sharedParents = countGroups.entries
+        .where((e) => e.value.length >= 3 && e.key >= 5)
+        .toList()
+      ..sort((a, b) => b.key.compareTo(a.key));
+    if (sharedParents.isNotEmpty) {
+      sb.writeln('');
+      sb.writeln('Shared parent rebuilds (multiple widgets same count = parent triggering all):');
+      for (final group in sharedParents) {
+        // Extract file from first widget key
+        final firstKey = group.value.first;
+        final fileMatch = RegExp(r'\(([^:]+\.dart)').firstMatch(firstKey);
+        final file = fileMatch?.group(1) ?? 'unknown';
+        sb.writeln('  ${group.key}× rebuilds — ${group.value.length} widgets in $file share a parent');
+        sb.writeln('    → Wrap parent with BlocSelector/const or move state lower in tree');
+        // Show line cluster
+        final lines = group.value
+            .map((k) => RegExp(r':(\d+)\)').firstMatch(k)?.group(1))
+            .whereType<String>()
+            .toList()
+          ..sort();
+        if (lines.isNotEmpty) {
+          sb.writeln('    Lines: ${lines.join(', ')}');
+        }
+      }
+    }
+
     // Animation widgets rebuilding = likely running when idle
     if (_animationWidgets.isNotEmpty) {
       sb.writeln('');
