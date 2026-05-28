@@ -1,8 +1,8 @@
 # flutter_devtools_mcp
 
-> An MCP (Model Context Protocol) server that connects to a running Flutter app via `vm_service` and exposes 26 performance, memory, and debugging tools as AI-queryable actions.
+> An MCP (Model Context Protocol) server that connects to a running Flutter app via `vm_service` and exposes 27 performance, memory, and debugging tools as AI-queryable actions.
 
-Ask Claude (or any MCP-compatible AI) **"why is my app slow?"** and get an actual diagnosis — not generic advice.
+Ask Claude or Gemini **"why is my app slow?"** and get an actual diagnosis — not generic advice.
 
 ---
 
@@ -11,19 +11,38 @@ Ask Claude (or any MCP-compatible AI) **"why is my app slow?"** and get an actua
 Flutter DevTools is powerful but hard to use. This MCP server bridges the gap: it speaks directly to the Dart VM, collects the same data DevTools collects, and translates it into plain English that an AI agent can reason about and explain.
 
 ```
-You:   "My app feels janky when I scroll. Why?"
+You:    "Why is my app slow?"
 
-Claude: [calls connect_to_app]
-        Connected. VM 3.4, isolate: main
+AI:     [calls connect_to_app]
+        Connected. VM 3.11 | isolate: main | debug mode | iOS arm64
 
-        [calls analyze_jank_causes]
-        23% frames janky — MODERATE
-        UI thread: ProductCard.build() = 8.4% CPU self-time
-        → Wrap static children in const, cache expensive computations
+        [calls capture_frame_timing duration=5]
+        Frame Analysis — 198 frames (~38.4 fps) via Flutter.Frame events
+        Budget: 16ms at 60fps
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        Janky: 0/198 (0.0%) — GOOD
+        Worst frame: 4.54ms work (Build: 2.92ms, Raster: 1.61ms)
 
-        [calls get_widget_rebuild_counts]
-        ProductCard: 143 rebuilds ← EXCESSIVE
-        → Use BlocSelector to narrow rebuild scope
+        [calls get_widget_rebuild_counts duration=8]
+        Widget Rebuild Counts:
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Text (patient_dashboard.dart:142)       62 rebuilds  ← EXCESSIVE
+          SizedBox (patient_dashboard.dart:98)    60 rebuilds  ← EXCESSIVE
+          SlideTransition (app_wrapper.dart:31)   29 rebuilds  ← HIGH
+          BlocProvider (main.dart:44)             26 rebuilds  ← HIGH
+
+        Animation widgets rebuilding (possible idle animation leak):
+          SlideTransition (app_wrapper.dart:31): 29 rebuilds
+          → ensure AnimationController.dispose() called
+
+        [calls get_cpu_hotspots duration=5]
+        CPU Hotspots (5.0s window, 678 samples)
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          1.  1.6%   13.3%  RenderObject._paintWithContext
+          2.  1.1%    1.3%  Duration.Duration
+
+        Suggestions:
+        • RenderObject._paintWithContext: 13.3% total — expensive call chain. Check callees.
 ```
 
 ---
@@ -32,7 +51,7 @@ Claude: [calls connect_to_app]
 
 - Flutter app running in **debug or profile mode** (`flutter run` or `flutter run --profile`)
 - Dart SDK ≥ 3.4.0
-- Any MCP-compatible client (Claude Desktop, Claude Code, etc.)
+- Any MCP-compatible client (Claude Desktop, Claude Code, Gemini CLI, etc.)
 
 ---
 
@@ -41,8 +60,8 @@ Claude: [calls connect_to_app]
 ### Option A — compile (recommended)
 
 ```bash
-git clone https://github.com/ayushshende/flutter_devtools_mcp
-cd flutter_devtools_mcp
+git clone https://github.com/cybersleuth0/flutter-profile-mcp
+cd flutter-profile-mcp
 dart pub get
 dart compile exe bin/flutter_devtools_mcp.dart -o flutter_devtools_mcp
 ```
@@ -50,8 +69,8 @@ dart compile exe bin/flutter_devtools_mcp.dart -o flutter_devtools_mcp
 ### Option B — run directly with Dart
 
 ```bash
-git clone https://github.com/ayushshende/flutter_devtools_mcp
-cd flutter_devtools_mcp
+git clone https://github.com/cybersleuth0/flutter-profile-mcp
+cd flutter-profile-mcp
 dart pub get
 ```
 
@@ -78,7 +97,7 @@ Or without compiling:
   "mcpServers": {
     "flutter-devtools": {
       "command": "dart",
-      "args": ["run", "/absolute/path/to/flutter_devtools_mcp/bin/flutter_devtools_mcp.dart"]
+      "args": ["run", "/absolute/path/to/flutter-profile-mcp/bin/flutter_devtools_mcp.dart"]
     }
   }
 }
@@ -88,14 +107,14 @@ Restart Claude Desktop after editing.
 
 ---
 
-## Claude Code setup
+## Claude Code / Gemini CLI setup
 
-Add to your project's `.claude/settings.json`:
+Add to your project's `.claude/settings.json` or `~/.gemini/settings.json`:
 
 ```json
 {
   "mcpServers": {
-    "flutter-devtools": {
+    "flutter-profile": {
       "command": "/absolute/path/to/flutter_devtools_mcp"
     }
   }
@@ -107,18 +126,18 @@ Add to your project's `.claude/settings.json`:
 ## Usage
 
 1. Run your Flutter app: `flutter run`
-2. Copy the VM service URI from terminal output — looks like `http://127.0.0.1:PORT/TOKEN=/`
-3. Tell Claude: **"Connect to my Flutter app at `<uri>`"**
+2. Copy the VM service URI from terminal output — looks like `ws://127.0.0.1:PORT/TOKEN=/ws`
+3. Tell the AI: **"Connect to my Flutter app at `<uri>`"**
 4. Ask anything:
-   - "Why is my app slow?"
-   - "Are there any memory leaks?"
+   - "Why is my app slow? Capture 5 seconds while I scroll."
    - "Which widgets rebuild too often?"
-   - "Show me recent HTTP requests"
+   - "Are there any memory leaks?"
+   - "Show me recent HTTP requests."
    - "What errors appeared in the last 5 seconds?"
 
 ---
 
-## Tools (26)
+## Tools (27)
 
 ### Connection
 | Tool | Description |
@@ -129,11 +148,12 @@ Add to your project's `.claude/settings.json`:
 ### Performance
 | Tool | Description |
 |------|-------------|
-| `capture_frame_timing` | Record frame times, detect jank (>16ms), identify UI vs raster bottleneck |
-| `get_cpu_hotspots` | CPU profile — top functions by self-time with fix suggestions |
-| `get_widget_rebuild_counts` | Track which widgets rebuild excessively (the #1 cause of jank) |
-| `analyze_jank_causes` | Composite: frames + CPU → prioritized diagnosis with specific fixes |
+| `capture_frame_timing` | Record frame times via Flutter.Frame stream, detect jank (>16ms), identify UI vs raster bottleneck |
+| `get_cpu_hotspots` | CPU profile — top Dart functions by self-time and call-chain cost, with fix suggestions |
+| `get_widget_rebuild_counts` | Track which widgets rebuild excessively with file:line context — the #1 cause of jank |
+| `analyze_jank_causes` | Composite: frames + CPU → synthesized verdict + prioritized diagnosis |
 | `enable_performance_overlay` | Toggle on-screen GPU/UI thread bars |
+| `debug_frame_events` | Inspect raw timeline event names — use when frame capture returns 0 frames |
 
 ### Memory
 | Tool | Description |
@@ -158,14 +178,14 @@ Add to your project's `.claude/settings.json`:
 | Tool | Description |
 |------|-------------|
 | `get_http_profile` | Recent HTTP requests with method, status, timing, size |
-| `watch_network` | Live-stream new HTTP requests as they happen — catch slow APIs in real time |
+| `watch_network` | Live-stream new HTTP requests as they happen |
 | `get_http_request_body` | Full request/response headers for a specific request ID |
 
 ### Navigation & Isolates
 | Tool | Description |
 |------|-------------|
 | `get_navigation_stack` | Current route + full navigation stack — detect route leaks |
-| `list_isolates` | All running isolates with heap usage — background workers visible here |
+| `list_isolates` | All running isolates with heap usage |
 
 ### Visual Debugging
 | Tool | Description |
@@ -175,7 +195,7 @@ Add to your project's `.claude/settings.json`:
 ### Code Evaluation
 | Tool | Description |
 |------|-------------|
-| `eval_expression` | Evaluate Dart expression in live app context — inspect variable values, list lengths, object state |
+| `eval_expression` | Evaluate Dart expression in live app context |
 
 ### Developer Workflow
 | Tool | Description |
@@ -189,26 +209,34 @@ Add to your project's `.claude/settings.json`:
 
 | Mode | Command | What works |
 |------|---------|------------|
-| Debug | `flutter run` | All 26 tools including widget inspector, rebuild counts |
-| Profile | `flutter run --profile` | Performance tools (more accurate numbers, no debug overhead) |
+| Debug | `flutter run` | All 27 tools including widget inspector, rebuild counts |
+| Profile | `flutter run --profile` | Performance tools (accurate numbers, no debug overhead) |
 | Release | `flutter run --release` | **Nothing** — VM service not available |
 
 For accurate frame/CPU numbers, use profile mode. For widget tree and rebuild tracking, use debug mode.
 
 ---
 
+## How frame timing works
+
+`capture_frame_timing` uses the `Flutter.Frame` extension event stream — the same source as Flutter DevTools' Performance tab. Flutter emits one event per frame containing pre-computed `build`, `raster`, and `elapsed` (wall time including vsync wait) in microseconds.
+
+**Jank is measured on `build + raster` (actual CPU/GPU work), not `elapsed`.** `elapsed` always includes vsync idle time (~16ms at 60fps) which would make every frame appear janky.
+
+---
+
 ## Architecture
 
 ```
-flutter_devtools_mcp/
+flutter-profile-mcp/
 ├── bin/
-│   └── flutter_devtools_mcp.dart   # Entry point — stdio MCP transport
+│   └── flutter_devtools_mcp.dart     # Entry point — stdio MCP transport
 ├── lib/
-│   ├── server.dart                  # MCPServer subclass — all 26 tools registered here
+│   ├── server.dart                   # MCPServer — all 27 tools registered
 │   └── analysis/
-│       ├── jank_analyzer.dart       # Timeline → frame data → jank report
-│       ├── cpu_analyzer.dart        # CpuSamples → hotspot report
-│       └── rebuild_collector.dart   # Flutter.RebuiltWidgets events → rebuild counts
+│       ├── jank_analyzer.dart        # Flutter.Frame stream → frame data → jank report
+│       ├── cpu_analyzer.dart         # CpuSamples → hotspot report (handles dynamic fn field)
+│       └── rebuild_collector.dart    # RebuiltWidgets events → rebuild counts with file:line
 ```
 
 Built with:
