@@ -73,8 +73,12 @@ class CpuAnalyzer {
       name.startsWith('[NativeFunction') ||
       name.startsWith('dart:') ||
       name.startsWith('dart_') ||
-      name.contains('::') // C++ symbols (flutter engine, objc_msgSend, etc.)
-      ;
+      name.startsWith('_CF') ||       // CoreFoundation C funcs
+      name.startsWith('objc_') ||     // ObjC runtime
+      name.startsWith('_objc_') ||
+      name.startsWith('_platform_') || // platform libc
+      name == 'madvise' ||
+      name.contains('::');            // C++ symbols
 
   String _advice(List<ProfileFunction> hot, int total) {
     final lines = <String>[];
