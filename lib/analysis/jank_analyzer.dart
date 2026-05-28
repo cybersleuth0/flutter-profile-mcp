@@ -34,7 +34,7 @@ class JankAnalyzer {
   ) async {
     final frames = <FrameData>[];
 
-    await service.streamListen(EventStreams.kExtension);
+    await service.streamListen(EventStreams.kExtension).catchError((_) => Success());
     final sub = service.onExtensionEvent.listen((event) {
       if (event.extensionKind != 'Flutter.Frame') return;
       final data = event.extensionData?.data ?? event.json;

@@ -602,12 +602,13 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
       final collector = RebuildCollector();
 
+      // Start listening BEFORE enabling — first event includes locations map
+      collector.start(_service!);
       await _service!.callServiceExtension(
         'ext.flutter.inspector.trackRebuildDirtyWidgets',
         isolateId: _isolateId,
         args: {'enabled': true},
       );
-      collector.start(_service!);
       await Future.delayed(Duration(seconds: dur));
       await _service!.callServiceExtension(
         'ext.flutter.inspector.trackRebuildDirtyWidgets',
