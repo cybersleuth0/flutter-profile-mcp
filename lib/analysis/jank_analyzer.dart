@@ -19,22 +19,58 @@ class FrameData {
       totalDurationMicros > (1000000 ~/ targetFps);
 }
 
-class _RawFrame {
-  final int start;
-  final int duration;
-  _RawFrame(this.start, this.duration);
-}
-
 class JankAnalyzer {
+  /// Primary method: collect FrameTiming events from flutter.frame extension stream.
+  /// Flutter emits pre-computed build+raster+vsync breakdown per frame.
+  /// Much more accurate than parsing raw timeline events.
+  Future<List<FrameData>> collectFromFrameTimings(
+    VmService service,
+    String isolateId,
+    Duration window,
+  ) async {
+    final frames = <FrameData>[];
+
+    await service.streamListen(EventStreams.kExtension);
+    final sub = service.onExtensionEvent.listen((event) {
+      if (event.extensionKind != 'Flutter.Frame') return;
+      final data = event.extensionData?.data ?? event.json;
+      if (data == null) return;
+
+      // Flutter.Frame payload:
+      // { number, startTime, elapsed, build, raster, vsyncOverhead }
+      // All times in microseconds
+      final build = (data['build'] as num?)?.toInt() ?? 0;
+      final raster = (data['raster'] as num?)?.toInt() ?? 0;
+      final elapsed = (data['elapsed'] as num?)?.toInt() ??
+          (build + raster); // elapsed = build + raster + vsyncOverhead
+      final startTime = (data['startTime'] as num?)?.toInt() ?? 0;
+
+      if (elapsed <= 0 && build <= 0) return;
+
+      final total = elapsed > 0 ? elapsed : (build + raster);
+      frames.add(FrameData(
+        frameNumber: frames.length + 1,
+        uiStartMicros: startTime,
+        uiDurationMicros: build,
+        rasterDurationMicros: raster,
+        totalDurationMicros: total,
+      ));
+    });
+
+    await Future.delayed(window);
+    await sub.cancel();
+    return frames;
+  }
+
+  /// Fallback: parse raw timeline — use async phase ('b'/'e') for [Dart] Frame
+  /// and sync phase ('B'/'E') for [Embedder] raster events.
   List<FrameData> parseFrames(Timeline timeline) {
     final events = timeline.traceEvents ?? [];
 
     final uiFrames = <_RawFrame>[];
     final rasterFrames = <_RawFrame>[];
-
-    // Pass 1: collect all UI frame intervals from [Dart] Frame events
-    // and all raster intervals from [Embedder] GPURasterizer::Draw
-    final Map<String, int> openBegin = {}; // key = "name|tid"
+    final Map<String, int> asyncBegin = {}; // async frames: key = 'name|id'
+    final Map<String, int> syncBegin = {};  // sync frames: key = 'name|tid'
 
     for (final event in events) {
       final raw = event.json;
@@ -44,35 +80,43 @@ class JankAnalyzer {
       final ts = (raw['ts'] as num?)?.toInt() ?? 0;
       final tid = raw['tid'].toString();
       final cat = raw['cat'] as String? ?? '';
+      // Async events use 'id' for correlation, not tid
+      final id = raw['id']?.toString() ?? raw['id2']?.toString() ?? tid;
 
-      // UI: [Dart] Frame — top-level frame bracket confirmed on iOS Impeller
+      // ── UI frames ────────────────────────────────────────────────────────
+      // [Dart] Frame is async (ph='b'/'e') — TimelineTask in scheduler/binding.dart
       if (name == 'Frame' && cat == 'Dart') {
-        final key = 'ui|$tid';
-        if (ph == 'B') {
-          openBegin[key] = ts;
-        } else if (ph == 'E') {
-          final begin = openBegin.remove(key);
+        if (ph == 'b') {
+          asyncBegin['frame|$id'] = ts;
+        } else if (ph == 'e') {
+          final begin = asyncBegin.remove('frame|$id');
           if (begin != null && ts > begin) {
             uiFrames.add(_RawFrame(begin, ts - begin));
           }
-        } else if (ph == 'X') {
-          final dur = (raw['dur'] as num?)?.toInt() ?? 0;
-          if (dur > 0) uiFrames.add(_RawFrame(ts, dur));
         }
       }
 
-      // Raster: [Embedder] GPURasterizer::Draw — confirmed on iOS Impeller
-      // Also try CompositorContext::ScopedFrame::Raster as fallback
-      final isRaster = (name == 'GPURasterizer::Draw' ||
-              name == 'CompositorContext::ScopedFrame::Raster') &&
-          cat == 'Embedder';
-
-      if (isRaster) {
-        final key = 'raster|$tid';
+      // [Embedder] Animator::BeginFrame is sync — fallback if async Frame absent
+      if (name == 'Animator::BeginFrame' && cat == 'Embedder') {
         if (ph == 'B') {
-          openBegin[key] = ts;
+          syncBegin['animbegin|$tid'] = ts;
         } else if (ph == 'E') {
-          final begin = openBegin.remove(key);
+          final begin = syncBegin.remove('animbegin|$tid');
+          if (begin != null && ts > begin) {
+            uiFrames.add(_RawFrame(begin, ts - begin));
+          }
+        }
+      }
+
+      // ── Raster frames ─────────────────────────────────────────────────────
+      // [Embedder] GPURasterizer::Draw — sync duration event on raster thread
+      if ((name == 'GPURasterizer::Draw' ||
+              name == 'CompositorContext::ScopedFrame::Raster') &&
+          cat == 'Embedder') {
+        if (ph == 'B') {
+          syncBegin['raster|$tid'] = ts;
+        } else if (ph == 'E') {
+          final begin = syncBegin.remove('raster|$tid');
           if (begin != null && ts > begin) {
             rasterFrames.add(_RawFrame(begin, ts - begin));
           }
@@ -85,34 +129,27 @@ class JankAnalyzer {
 
     if (uiFrames.isEmpty) return [];
 
-    // Sort both by start time
     uiFrames.sort((a, b) => a.start.compareTo(b.start));
     rasterFrames.sort((a, b) => a.start.compareTo(b.start));
 
-    // Pass 2: pair each UI frame with the raster frame that starts
-    // closest AFTER the UI frame starts (pipeline: raster follows UI)
+    // Timestamp-based pairing: match each UI frame to nearest raster frame
     final frames = <FrameData>[];
-    int rasterIdx = 0;
+    int rIdx = 0;
 
     for (int i = 0; i < uiFrames.length; i++) {
       final ui = uiFrames[i];
-
-      // Find first raster frame that starts at or after this UI frame start
-      while (rasterIdx < rasterFrames.length &&
-          rasterFrames[rasterIdx].start < ui.start) {
-        rasterIdx++;
+      while (rIdx < rasterFrames.length &&
+          rasterFrames[rIdx].start < ui.start) {
+        rIdx++;
       }
-
       int rasterDur = 0;
-      if (rasterIdx < rasterFrames.length) {
-        final raster = rasterFrames[rasterIdx];
-        // Only pair if raster starts within 2 frame budgets of UI start (33ms)
-        if (raster.start - ui.start < 33000) {
-          rasterDur = raster.duration;
-          rasterIdx++; // consume this raster frame
+      if (rIdx < rasterFrames.length) {
+        final r = rasterFrames[rIdx];
+        if (r.start - ui.start < 33000) {
+          rasterDur = r.duration;
+          rIdx++;
         }
       }
-
       final total = ui.duration > rasterDur ? ui.duration : rasterDur;
       frames.add(FrameData(
         frameNumber: i + 1,
@@ -126,22 +163,20 @@ class JankAnalyzer {
     return frames;
   }
 
-  /// Debug: return all unique [cat] name pairs — diagnose missing frames
   List<String> debugEventNames(Timeline timeline) {
     final names = <String>{};
     for (final e in timeline.traceEvents ?? []) {
       final name = e.json?['name'] as String?;
       final cat = e.json?['cat'] as String?;
-      if (name != null) names.add('[$cat] $name');
+      final ph = e.json?['ph'] as String?;
+      if (name != null) names.add('[$cat] (ph=$ph) $name');
     }
     return names.toList()..sort();
   }
 
-  /// Debug: count raw frame events before pairing
   Map<String, int> debugFrameCounts(Timeline timeline) {
-    int uiFrameCount = 0;
-    int rasterCount = 0;
-    int totalEvents = timeline.traceEvents?.length ?? 0;
+    int uiAsync = 0, uiSync = 0, rasterCount = 0;
+    final total = timeline.traceEvents?.length ?? 0;
 
     for (final e in timeline.traceEvents ?? []) {
       final raw = e.json;
@@ -149,24 +184,24 @@ class JankAnalyzer {
       final name = raw['name'] as String? ?? '';
       final cat = raw['cat'] as String? ?? '';
       final ph = raw['ph'] as String? ?? '';
-      if (name == 'Frame' && cat == 'Dart' && (ph == 'B' || ph == 'X')) {
-        uiFrameCount++;
-      }
+
+      if (name == 'Frame' && cat == 'Dart' && ph == 'b') uiAsync++;
+      if (name == 'Animator::BeginFrame' && cat == 'Embedder' && ph == 'B') uiSync++;
       if ((name == 'GPURasterizer::Draw' ||
               name == 'CompositorContext::ScopedFrame::Raster') &&
           cat == 'Embedder' &&
-          (ph == 'B' || ph == 'X')) {
-        rasterCount++;
-      }
+          (ph == 'B' || ph == 'X')) rasterCount++;
     }
     return {
-      'total_events': totalEvents,
-      'ui_frames': uiFrameCount,
+      'total_events': total,
+      'ui_async_frames': uiAsync,   // [Dart] Frame async — primary
+      'ui_sync_frames': uiSync,     // Animator::BeginFrame sync — fallback
       'raster_frames': rasterCount,
     };
   }
 
-  String generateReport(List<FrameData> frames, {int targetFps = 60}) {
+  String generateReport(List<FrameData> frames,
+      {int targetFps = 60, bool fromFrameTimings = false}) {
     if (frames.isEmpty) {
       return 'No frame data captured. Interact with the app during recording window.';
     }
@@ -186,54 +221,53 @@ class JankAnalyzer {
     final sorted = [...frames]
       ..sort((a, b) => b.totalDurationMicros.compareTo(a.totalDurationMicros));
 
-    // Estimate actual FPS from timestamps
     String fpsNote = '';
     if (frames.length >= 2) {
       final windowMicros =
           frames.last.uiStartMicros - frames.first.uiStartMicros;
       if (windowMicros > 0) {
-        final measuredFps =
+        final fps =
             ((frames.length - 1) / (windowMicros / 1e6)).toStringAsFixed(1);
-        fpsNote = ' (~$measuredFps fps measured)';
+        fpsNote = ' (~$fps fps)';
       }
     }
 
-    final hasRasterData = frames.any((f) => f.rasterDurationMicros > 0);
+    final source = fromFrameTimings ? 'Flutter.Frame events' : 'timeline parse';
+    final hasRaster = frames.any((f) => f.rasterDurationMicros > 0);
 
     final sb = StringBuffer();
     sb.writeln(
-        'Frame Analysis (${frames.length} frames$fpsNote, ${targetFps}fps budget = ${budgetMicros ~/ 1000}ms)');
+        'Frame Analysis — ${frames.length} frames$fpsNote via $source');
+    sb.writeln('Budget: ${budgetMicros ~/ 1000}ms at ${targetFps}fps');
     sb.writeln('━' * 60);
     sb.writeln(
-        'Janky frames: ${janky.length}/${frames.length} ($jankyPct%) — ${_severity(janky.length, frames.length)}');
+        'Janky: ${janky.length}/${frames.length} ($jankyPct%) — ${_severity(janky.length, frames.length)}');
 
-    if (!hasRasterData) {
-      sb.writeln('Raster data: not captured (raster thread events absent)');
-      sb.writeln('  → Run in profile mode for raster timing: flutter run --profile');
+    if (!hasRaster) {
+      sb.writeln(
+          'Raster timing: unavailable in debug mode (run --profile for raster data)');
     }
 
     if (uiJank > 0) {
       sb.writeln('');
-      sb.writeln('UI thread jank: $uiJank frames');
-      sb.writeln(
-          '  → Dart code slow. Check build(), layout, compute on main isolate.');
+      sb.writeln('UI jank: $uiJank frames over budget');
+      sb.writeln('  → Dart code slow. Check build(), layout, heavy compute.');
     }
     if (rasterJank > 0) {
       sb.writeln('');
-      sb.writeln('Raster thread jank: $rasterJank frames');
-      sb.writeln(
-          '  → GPU work slow. Check: large images, clips, opacity layers, shadows.');
+      sb.writeln('Raster jank: $rasterJank frames');
+      sb.writeln('  → GPU slow. Check: large images, clips, opacity, shadows.');
     }
 
     sb.writeln('');
     sb.writeln('Worst 5 frames:');
     for (final f in sorted.take(5)) {
-      final rasterStr = hasRasterData
+      final r = hasRaster
           ? ', Raster: ${(f.rasterDurationMicros / 1000).toStringAsFixed(2)}ms'
           : '';
       sb.writeln(
           '  Frame ${f.frameNumber}: ${(f.totalDurationMicros / 1000).toStringAsFixed(2)}ms'
-          ' (UI: ${(f.uiDurationMicros / 1000).toStringAsFixed(2)}ms$rasterStr)');
+          ' (Build: ${(f.uiDurationMicros / 1000).toStringAsFixed(2)}ms$r)');
     }
 
     return sb.toString();
@@ -246,4 +280,10 @@ class JankAnalyzer {
     if (pct < 0.30) return 'MODERATE';
     return 'SEVERE';
   }
+}
+
+class _RawFrame {
+  final int start;
+  final int duration;
+  _RawFrame(this.start, this.duration);
 }

@@ -535,32 +535,43 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 3;
       final fps = (req.arguments?['target_fps'] as num?)?.toInt() ?? 60;
 
-      // All flags: Embedder covers Flutter engine, API covers user code markers
+      // Primary: Flutter.Frame extension stream (pre-computed FrameTiming — same as DevTools)
+      final frames = await _jank.collectFromFrameTimings(
+          _service!, _isolateId!, Duration(seconds: dur));
+
+      if (frames.isNotEmpty) {
+        final report =
+            _jank.generateReport(frames, targetFps: fps, fromFrameTimings: true);
+        return _ok(report);
+      }
+
+      // Fallback: parse raw timeline (profile mode or extension stream unavailable)
       await _service!.setVMTimelineFlags(['Embedder', 'Dart', 'GC', 'API']);
       await _service!.clearVMTimeline();
       await Future.delayed(Duration(seconds: dur));
       final timeline = await _service!.getVMTimeline();
 
-      final frames = _jank.parseFrames(timeline);
-      if (frames.isEmpty) {
+      final fallbackFrames = _jank.parseFrames(timeline);
+      if (fallbackFrames.isEmpty) {
         final counts = _jank.debugFrameCounts(timeline);
         final total = counts['total_events'] ?? 0;
-        final uiCount = counts['ui_frames'] ?? 0;
+        final uiCount = counts['ui_async_frames'] ?? 0;
         final rasterCount = counts['raster_frames'] ?? 0;
         if (total > 0) {
           return _ok(
               'Timeline captured $total events but no frames parsed.\n'
-              'Raw frame markers found: UI=$uiCount, Raster=$rasterCount\n\n'
-              'This usually means the app was idle. Interact during the window.\n'
-              'Run debug_frame_events to inspect all event names.');
+              'Raw frame markers: UI=$uiCount, Raster=$rasterCount\n\n'
+              'App may have been idle. Interact during the recording window.\n'
+              'Run debug_frame_events to inspect event names.');
         }
         return _ok(
             'No timeline events. Interact with app during the ${dur}s window.');
       }
 
       final counts = _jank.debugFrameCounts(timeline);
-      final report = _jank.generateReport(frames, targetFps: fps);
-      final rawNote = 'Raw: UI=${counts['ui_frames']} raster=${counts['raster_frames']} events total=${counts['total_events']}';
+      final report = _jank.generateReport(fallbackFrames, targetFps: fps);
+      final rawNote =
+          'Raw: UI=${counts['ui_async_frames']} raster=${counts['raster_frames']} total=${counts['total_events']}';
       return _ok('$report\n[$rawNote]');
     } catch (e) {
       return _err(e);
@@ -1654,7 +1665,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       final sb = StringBuffer();
       sb.writeln('Timeline: $total events in ${dur}s');
       sb.writeln(
-          'Frame markers: UI=[Dart]Frame × ${counts['ui_frames']}, '
+          'Frame markers: UI=[Dart]Frame × ${counts['ui_async_frames']}, '
           'Raster=[Embedder]GPURasterizer::Draw × ${counts['raster_frames']}');
       sb.writeln('━' * 55);
       sb.writeln('Unique event names (${names.length}):');
