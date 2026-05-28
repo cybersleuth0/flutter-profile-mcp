@@ -1,6 +1,6 @@
-name: flutter_devtools_mcp
+name: flutter_profile_mcp
 description: MCP server for Flutter performance analysis via vm_service
-version: 0.1.0
+version: 1.0.0
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
