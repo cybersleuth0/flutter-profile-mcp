@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+- Add `executables` entry so `dart pub global activate flutter_profile_mcp` installs `flutter-profile-mcp` command
+
 ## 1.0.0
 
 - Initial release
