@@ -543,19 +543,25 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
 
       final frames = _jank.parseFrames(timeline);
       if (frames.isEmpty) {
-        // Fallback: report raw event count so user knows data was captured
-        final eventCount = timeline.traceEvents?.length ?? 0;
-        if (eventCount > 0) {
-          final names = _jank.debugEventNames(timeline).take(20).join('\n  ');
+        final counts = _jank.debugFrameCounts(timeline);
+        final total = counts['total_events'] ?? 0;
+        final uiCount = counts['ui_frames'] ?? 0;
+        final rasterCount = counts['raster_frames'] ?? 0;
+        if (total > 0) {
           return _ok(
-              'Timeline captured $eventCount events but no frame markers matched.\n'
-              'Run debug_frame_events to see what the engine emits.\n\n'
-              'Sample event names:\n  $names');
+              'Timeline captured $total events but no frames parsed.\n'
+              'Raw frame markers found: UI=$uiCount, Raster=$rasterCount\n\n'
+              'This usually means the app was idle. Interact during the window.\n'
+              'Run debug_frame_events to inspect all event names.');
         }
         return _ok(
-            'No timeline events captured. Interact with the app during the ${dur}s window.');
+            'No timeline events. Interact with app during the ${dur}s window.');
       }
-      return _ok(_jank.generateReport(frames, targetFps: fps));
+
+      final counts = _jank.debugFrameCounts(timeline);
+      final report = _jank.generateReport(frames, targetFps: fps);
+      final rawNote = 'Raw: UI=${counts['ui_frames']} raster=${counts['raster_frames']} events total=${counts['total_events']}';
+      return _ok('$report\n[$rawNote]');
     } catch (e) {
       return _err(e);
     }
@@ -1644,10 +1650,14 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       }
 
       final names = _jank.debugEventNames(timeline);
+      final counts = _jank.debugFrameCounts(timeline);
       final sb = StringBuffer();
       sb.writeln('Timeline: $total events in ${dur}s');
-      sb.writeln('Unique event names (${names.length}):');
+      sb.writeln(
+          'Frame markers: UI=[Dart]Frame × ${counts['ui_frames']}, '
+          'Raster=[Embedder]GPURasterizer::Draw × ${counts['raster_frames']}');
       sb.writeln('━' * 55);
+      sb.writeln('Unique event names (${names.length}):');
       for (final n in names.take(60)) {
         sb.writeln('  $n');
       }
