@@ -8,6 +8,9 @@ issue_tracker: https://github.com/cybersleuth0/flutter-profile-mcp/issues
 environment:
   sdk: ">=3.4.0 <4.0.0"
 
+executables:
+  flutter-profile-mcp: flutter_devtools_mcp
+
 dependencies:
   dart_mcp: ^0.3.0
   vm_service: ^14.0.0
