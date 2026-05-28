@@ -57,7 +57,20 @@ AI:     [calls connect_to_app]
 
 ## Installation
 
-### Option A — compile (recommended)
+### Option A — pub.dev (recommended, no git clone needed)
+
+```bash
+dart pub global activate flutter_profile_mcp
+```
+
+This installs the `flutter-profile-mcp` command globally. Use this path in your MCP config:
+
+```bash
+which flutter-profile-mcp
+# e.g. /Users/you/.pub-cache/bin/flutter-profile-mcp
+```
+
+### Option B — compile from source
 
 ```bash
 git clone https://github.com/cybersleuth0/flutter-profile-mcp
@@ -66,7 +79,7 @@ dart pub get
 dart compile exe bin/flutter_devtools_mcp.dart -o flutter_devtools_mcp
 ```
 
-### Option B — run directly with Dart
+### Option C — run directly with Dart
 
 ```bash
 git clone https://github.com/cybersleuth0/flutter-profile-mcp
@@ -83,25 +96,14 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 ```json
 {
   "mcpServers": {
-    "flutter-devtools": {
-      "command": "/absolute/path/to/flutter_devtools_mcp"
+    "flutter-profile": {
+      "command": "flutter-profile-mcp"
     }
   }
 }
 ```
 
-Or without compiling:
-
-```json
-{
-  "mcpServers": {
-    "flutter-devtools": {
-      "command": "dart",
-      "args": ["run", "/absolute/path/to/flutter-profile-mcp/bin/flutter_devtools_mcp.dart"]
-    }
-  }
-}
-```
+> **Note:** `flutter-profile-mcp` must be on your PATH. Run `dart pub global activate flutter_profile_mcp` first, then verify with `which flutter-profile-mcp`.
 
 Restart Claude Desktop after editing.
 
@@ -115,7 +117,7 @@ Add to your project's `.claude/settings.json` or `~/.gemini/settings.json`:
 {
   "mcpServers": {
     "flutter-profile": {
-      "command": "/absolute/path/to/flutter_devtools_mcp"
+      "command": "flutter-profile-mcp"
     }
   }
 }
