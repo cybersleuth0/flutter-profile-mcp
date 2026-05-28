@@ -2,7 +2,7 @@ import 'package:vm_service/vm_service.dart';
 
 class CpuAnalyzer {
   String generateHotspotReport(CpuSamples samples, {int topN = 10}) {
-    final total = samples.sampleCount ?? 1;
+    final total = (samples.sampleCount ?? 0) < 1 ? 1 : samples.sampleCount!;
     final functions = samples.functions ?? [];
 
     final sorted = [...functions]
@@ -66,10 +66,15 @@ class CpuAnalyzer {
   }
 
   bool _isVmInternal(String name) =>
+      name.isEmpty ||
       name == '[Truncated]' ||
       name == '[Native]' ||
-      name == '[Stub]' ||
-      name.startsWith('dart:');
+      name.startsWith('[Stub]') ||
+      name.startsWith('[NativeFunction') ||
+      name.startsWith('dart:') ||
+      name.startsWith('dart_') ||
+      name.contains('::') // C++ symbols (flutter engine, objc_msgSend, etc.)
+      ;
 
   String _advice(List<ProfileFunction> hot, int total) {
     final lines = <String>[];
