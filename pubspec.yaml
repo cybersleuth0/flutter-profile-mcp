@@ -1,6 +1,6 @@
 name: flutter_profile_mcp
 description: MCP server for Flutter performance profiling — 27 AI-queryable tools via vm_service. Ask Claude why your app is slow.
-version: 1.0.1
+version: 1.0.2
 homepage: https://github.com/cybersleuth0/flutter-profile-mcp
 repository: https://github.com/cybersleuth0/flutter-profile-mcp
 issue_tracker: https://github.com/cybersleuth0/flutter-profile-mcp/issues
