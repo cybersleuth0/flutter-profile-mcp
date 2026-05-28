@@ -3,9 +3,9 @@ import 'package:vm_service/vm_service.dart';
 class FrameData {
   final int frameNumber;
   final int uiStartMicros;
-  final int uiDurationMicros;
-  final int rasterDurationMicros;
-  final int totalDurationMicros;
+  final int uiDurationMicros;      // build time (Dart work)
+  final int rasterDurationMicros;  // raster time (GPU work)
+  final int totalDurationMicros;   // elapsed wall time (includes vsync wait)
 
   const FrameData({
     required this.frameNumber,
@@ -15,8 +15,12 @@ class FrameData {
     required this.totalDurationMicros,
   });
 
+  // Actual CPU/GPU work — excludes vsync overhead idle time
+  int get workDurationMicros => uiDurationMicros + rasterDurationMicros;
+
+  // Jank = actual work exceeds budget, not wall time (vsync idle inflates elapsed)
   bool isJanky({int targetFps = 60}) =>
-      totalDurationMicros > (1000000 ~/ targetFps);
+      workDurationMicros > (1000000 ~/ targetFps);
 }
 
 class JankAnalyzer {
@@ -219,7 +223,7 @@ class JankAnalyzer {
         .length;
 
     final sorted = [...frames]
-      ..sort((a, b) => b.totalDurationMicros.compareTo(a.totalDurationMicros));
+      ..sort((a, b) => b.workDurationMicros.compareTo(a.workDurationMicros));
 
     String fpsNote = '';
     if (frames.length >= 2) {
@@ -266,7 +270,7 @@ class JankAnalyzer {
           ? ', Raster: ${(f.rasterDurationMicros / 1000).toStringAsFixed(2)}ms'
           : '';
       sb.writeln(
-          '  Frame ${f.frameNumber}: ${(f.totalDurationMicros / 1000).toStringAsFixed(2)}ms'
+          '  Frame ${f.frameNumber}: ${(f.workDurationMicros / 1000).toStringAsFixed(2)}ms work'
           ' (Build: ${(f.uiDurationMicros / 1000).toStringAsFixed(2)}ms$r)');
     }
 
