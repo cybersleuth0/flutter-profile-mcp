@@ -230,9 +230,12 @@ class JankAnalyzer {
       final windowMicros =
           frames.last.uiStartMicros - frames.first.uiStartMicros;
       if (windowMicros > 0) {
-        final fps =
-            ((frames.length - 1) / (windowMicros / 1e6)).toStringAsFixed(1);
-        fpsNote = ' (~$fps fps)';
+        final rawFps = (frames.length - 1) / (windowMicros / 1e6);
+        // Cap at targetFps+10 — higher values indicate stale timeline events
+        final displayFps = rawFps > targetFps + 10
+            ? targetFps.toDouble()
+            : rawFps;
+        fpsNote = ' (~${displayFps.toStringAsFixed(1)} fps)';
       }
     }
 

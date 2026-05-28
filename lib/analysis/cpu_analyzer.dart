@@ -78,24 +78,25 @@ class CpuAnalyzer {
 
   String _advice(List<ProfileFunction> hot, int total) {
     final lines = <String>[];
-    for (final f in hot.take(3)) {
+    for (final f in hot.take(5)) {
       final selfPct = (f.exclusiveTicks ?? 0) / total * 100;
+      final totalPct = (f.inclusiveTicks ?? 0) / total * 100;
       final name = _formatName(f);
-      if (selfPct > 10 && name.toLowerCase().contains('build')) {
-        lines.add(
-            '• $name: high CPU in build(). Move expensive work outside build() or cache results.');
-      } else if (selfPct > 10 &&
-          (name.toLowerCase().contains('decode') ||
-              name.toLowerCase().contains('image'))) {
-        lines.add(
-            '• $name: image/decode cost. Use compute() to offload to background isolate.');
+      final nameLower = name.toLowerCase();
+
+      if (selfPct > 10 && nameLower.contains('build')) {
+        lines.add('• $name: ${selfPct.toStringAsFixed(1)}% self in build(). Move expensive work outside or cache results.');
+      } else if (selfPct > 10 && (nameLower.contains('decode') || nameLower.contains('image'))) {
+        lines.add('• $name: ${selfPct.toStringAsFixed(1)}% — image/decode cost. Use compute() to offload to isolate.');
       } else if (selfPct > 5) {
-        lines.add(
-            '• $name: ${selfPct.toStringAsFixed(1)}% self-time. Profile for algorithmic improvements.');
+        lines.add('• $name: ${selfPct.toStringAsFixed(1)}% self-time — algorithmic bottleneck.');
+      } else if (totalPct > 10 && selfPct < 2) {
+        // High inclusive but low exclusive = expensive call chain passing through this fn
+        lines.add('• $name: ${totalPct.toStringAsFixed(1)}% total (${selfPct.toStringAsFixed(1)}% self) — expensive call chain. Check callees.');
       }
     }
     return lines.isEmpty
-        ? 'No obvious CPU hotspots.'
+        ? 'No obvious CPU hotspots. App CPU usage looks healthy.'
         : 'Suggestions:\n${lines.join('\n')}';
   }
 }

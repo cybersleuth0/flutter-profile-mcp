@@ -679,7 +679,48 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
 
     final frameTxt = (frameResult.content.first as TextContent).text;
     final cpuTxt = (cpuResult.content.first as TextContent).text;
-    return _ok('$frameTxt\n\n$cpuTxt');
+
+    // Synthesize verdict from both reports
+    final verdict = _synthesizeVerdict(frameTxt, cpuTxt);
+    return _ok('$verdict\n\n━━ FRAME ANALYSIS ━━\n$frameTxt\n\n━━ CPU PROFILE ━━\n$cpuTxt');
+  }
+
+  String _synthesizeVerdict(String frameTxt, String cpuTxt) {
+    final sb = StringBuffer();
+    sb.writeln('┌─ JANK DIAGNOSIS ─────────────────────────────────────────┐');
+
+    // Parse jank % from frame report
+    final jankMatch = RegExp(r'Janky: \d+/\d+ \((\d+\.\d+)%\)').firstMatch(frameTxt);
+    final jankPct = double.tryParse(jankMatch?.group(1) ?? '0') ?? 0;
+
+    // Parse fps
+    final fpsMatch = RegExp(r'~(\d+\.\d+) fps').firstMatch(frameTxt);
+    final fps = double.tryParse(fpsMatch?.group(1) ?? '60') ?? 60;
+
+    // Parse top CPU hotspot self%
+    final cpuMatch = RegExp(r'1\.\s+([\d.]+)%\s+([\d.]+)%\s+(.+)').firstMatch(cpuTxt);
+    final topSelfPct = double.tryParse(cpuMatch?.group(1) ?? '0') ?? 0;
+    final topFn = cpuMatch?.group(3)?.trim() ?? '';
+
+    if (jankPct == 0 && fps >= 55) {
+      sb.writeln('│ ✓ HEALTHY — No jank detected. App running smoothly.      │');
+    } else if (jankPct > 20) {
+      sb.writeln('│ ✗ SEVERE JANK — $jankPct% frames over budget             │');
+      if (topSelfPct > 5) {
+        sb.writeln('│   PRIMARY: CPU bottleneck in $topFn');
+      } else if (fps < 45) {
+        sb.writeln('│   PRIMARY: Frame drops (${fps}fps) — UI thread blocked between frames');
+      }
+    } else if (fps < 50) {
+      sb.writeln('│ ⚠ LOW FPS — ${fps}fps (target 60). Frames slow to start. │');
+      sb.writeln('│   LIKELY: UI thread blocked by non-build work             │');
+      sb.writeln('│   CHECK: scroll listeners, timers, BLoC stream emissions  │');
+    } else {
+      sb.writeln('│ ~ MINOR — $jankPct% jank, ${fps}fps                       │');
+    }
+
+    sb.writeln('└───────────────────────────────────────────────────────────┘');
+    return sb.toString();
   }
 
   Future<CallToolResult> _handleHttpProfile(CallToolRequest req) async {

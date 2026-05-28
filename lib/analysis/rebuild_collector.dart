@@ -1,14 +1,23 @@
 import 'dart:async';
 import 'package:vm_service/vm_service.dart';
 
+class _WidgetLocation {
+  final String name;
+  final String file; // short filename
+  final int line;
+  _WidgetLocation(this.name, this.file, this.line);
+
+  String get key => '$name ($file:$line)';
+}
+
 class RebuildCollector {
-  // id → widget name cache (populated from 'locations'/'newLocations' payloads)
-  final Map<int, String> _idToName = {};
+  final Map<int, _WidgetLocation> _idToLocation = {};
   final Map<String, int> _counts = {};
+  // Track animation-like widgets for idle-animation detection
+  final Map<String, int> _animationWidgets = {};
   StreamSubscription<Event>? _sub;
 
   void start(VmService service) {
-    // Ignore error 103 (stream already subscribed) — another tool may own it
     service.streamListen(EventStreams.kExtension).catchError((_) => Success());
 
     _sub = service.onExtensionEvent.listen((event) {
@@ -18,7 +27,6 @@ class RebuildCollector {
       final data = event.extensionData?.data ?? event.json;
       if (data == null) return;
 
-      // Parse new location names from this event's 'locations' or 'newLocations'
       _parseLocations(data['locations']);
       _parseLocationsLegacy(data['newLocations']);
 
@@ -29,13 +37,17 @@ class RebuildCollector {
           final id = (events[i] as num?)?.toInt();
           final count = (events[i + 1] as num?)?.toInt() ?? 1;
           if (id == null) continue;
-          final name = _idToName[id] ?? 'Widget#$id';
-          _counts[name] = (_counts[name] ?? 0) + count;
+          final loc = _idToLocation[id];
+          final key = loc?.key ?? 'Widget#$id';
+          _counts[key] = (_counts[key] ?? 0) + count;
+          if (loc != null && _isAnimationWidget(loc.name)) {
+            _animationWidgets[key] = (_animationWidgets[key] ?? 0) + count;
+          }
         }
         return;
       }
 
-      // Fallback: older format {widgets: [{widget, count}]} or {counts: {name: n}}
+      // Fallback: older {widgets:[{widget,count}]} or {counts:{name:n}}
       final widgets = data['widgets'] as List<dynamic>?;
       if (widgets != null) {
         for (final w in widgets) {
@@ -54,6 +66,14 @@ class RebuildCollector {
     });
   }
 
+  bool _isAnimationWidget(String name) =>
+      name.contains('Transition') ||
+      name.contains('Animation') ||
+      name.contains('Animated') ||
+      name.contains('Fade') ||
+      name.contains('Slide') ||
+      name.contains('Scale');
+
   // v2.4+ format: {file: {ids:[...], names:[...], lines:[...], columns:[...]}}
   void _parseLocations(dynamic locations) {
     if (locations is! Map) return;
@@ -61,32 +81,40 @@ class RebuildCollector {
       if (fileData is! Map) return;
       final ids = fileData['ids'] as List<dynamic>?;
       final names = fileData['names'] as List<dynamic>?;
+      final lines = fileData['lines'] as List<dynamic>?;
       if (ids == null || names == null) return;
+      final shortFile = _shortFile(file as String);
       for (int i = 0; i < ids.length && i < names.length; i++) {
         final id = (ids[i] as num?)?.toInt();
         final name = names[i] as String?;
+        final line = (lines != null && i < lines.length)
+            ? (lines[i] as num?)?.toInt() ?? 0
+            : 0;
         if (id != null && name != null && name.isNotEmpty) {
-          _idToName[id] = name;
+          _idToLocation[id] = _WidgetLocation(name, shortFile, line);
         }
       }
     });
   }
 
-  // Legacy format: {file: [id, line, col, id, line, col, ...]} — no names
+  // Legacy format: {file: [id, line, col, ...]} — no widget names
   void _parseLocationsLegacy(dynamic newLocations) {
     if (newLocations is! Map) return;
     newLocations.forEach((file, entries) {
       if (entries is! List) return;
-      // Each entry is [id, line, col] — no name in legacy format, use filename
-      final shortFile = (file as String).split('/').last.replaceAll('.dart', '');
+      final shortFile = _shortFile(file as String);
       for (int i = 0; i + 2 < entries.length; i += 3) {
         final id = (entries[i] as num?)?.toInt();
-        if (id != null && !_idToName.containsKey(id)) {
-          _idToName[id] = shortFile;
+        final line = (entries[i + 1] as num?)?.toInt() ?? 0;
+        if (id != null && !_idToLocation.containsKey(id)) {
+          _idToLocation[id] = _WidgetLocation(shortFile, shortFile, line);
         }
       }
     });
   }
+
+  String _shortFile(String path) =>
+      path.split('/').last; // keep .dart extension for clarity
 
   Future<String> stopAndReport() async {
     await _sub?.cancel();
@@ -103,7 +131,7 @@ class RebuildCollector {
 
     final sb = StringBuffer();
     sb.writeln('Widget Rebuild Counts:');
-    sb.writeln('━' * 50);
+    sb.writeln('━' * 55);
 
     for (final e in sorted.take(20)) {
       final flag = e.value > 50
@@ -112,7 +140,17 @@ class RebuildCollector {
               ? '  ← HIGH'
               : '';
       sb.writeln(
-          '  ${e.key.padRight(35)} ${e.value.toString().padLeft(5)} rebuilds$flag');
+          '  ${e.key.padRight(42)} ${e.value.toString().padLeft(5)} rebuilds$flag');
+    }
+
+    // Animation widgets rebuilding = likely running when idle
+    if (_animationWidgets.isNotEmpty) {
+      sb.writeln('');
+      sb.writeln('Animation widgets rebuilding (possible idle animation leak):');
+      for (final e in _animationWidgets.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value))) {
+        sb.writeln('  ${e.key}: ${e.value} rebuilds — ensure AnimationController.dispose() called');
+      }
     }
 
     final excessive = sorted.where((e) => e.value > 50).toList();
