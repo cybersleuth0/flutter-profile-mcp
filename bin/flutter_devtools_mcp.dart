@@ -1,6 +1,6 @@
 import 'dart:io';
 import 'package:dart_mcp/stdio.dart';
-import 'package:flutter_devtools_mcp/server.dart';
+import 'package:flutter_profile_mcp/server.dart';
 
 void main() async {
   final server = FlutterDevToolsMCPServer(
