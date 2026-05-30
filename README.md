@@ -26,13 +26,13 @@ AI:     [calls connect_to_app]
         [calls get_widget_rebuild_counts duration=8]
         Widget Rebuild Counts:
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-          Text (patient_dashboard.dart:142)       62 rebuilds  ← EXCESSIVE
-          SizedBox (patient_dashboard.dart:98)    60 rebuilds  ← EXCESSIVE
-          SlideTransition (app_wrapper.dart:31)   29 rebuilds  ← HIGH
+          Text (product_list.dart:142)            62 rebuilds  ← EXCESSIVE
+          SizedBox (product_list.dart:98)         60 rebuilds  ← EXCESSIVE
+          SlideTransition (home_screen.dart:31)   29 rebuilds  ← HIGH
           BlocProvider (main.dart:44)             26 rebuilds  ← HIGH
 
         Animation widgets rebuilding (possible idle animation leak):
-          SlideTransition (app_wrapper.dart:31): 29 rebuilds
+          SlideTransition (home_screen.dart:31): 29 rebuilds
           → ensure AnimationController.dispose() called
 
         [calls get_cpu_hotspots duration=5]

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.5
+
+- Add pub.dev topics for discoverability
+- Fix README example: replace app-specific filenames with generic ones
+
 ## 1.0.4
 
 - Fix ready message: [flutter_devtools_mcp] → [flutter_profile_mcp]
