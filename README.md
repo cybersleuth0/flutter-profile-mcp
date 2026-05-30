@@ -130,16 +130,63 @@ Add to your project's `.claude/settings.json` or `~/.gemini/settings.json`:
 1. Run your Flutter app: `flutter run`
 2. Copy the VM service URI from terminal output — looks like `ws://127.0.0.1:PORT/TOKEN=/ws`
 3. Tell the AI: **"Connect to my Flutter app at `<uri>`"**
-4. Ask anything:
-   - "Why is my app slow? Capture 5 seconds while I scroll."
-   - "Which widgets rebuild too often?"
-   - "Are there any memory leaks?"
-   - "Show me recent HTTP requests."
-   - "What errors appeared in the last 5 seconds?"
+4. AI will show a health summary + available actions automatically
 
 ---
 
-## Tools (27)
+## What to ask the AI
+
+After connecting, use these prompts exactly — the AI knows what to do:
+
+### Performance problems
+```
+"My app feels slow when I scroll. Diagnose it."
+"Why is my app janky? Check the patient list screen."
+"The chart screen is slow. Find out why."
+"Run a full performance analysis while I use the app."
+```
+
+### Memory problems
+```
+"Check my app's memory usage."
+"Is my app leaking memory?"
+"Why is my heap at 90%?"
+"Show me what's using the most memory."
+```
+
+### Widget rebuild problems
+```
+"Which widgets are rebuilding too often?"
+"Find excessive rebuilds on the home screen."
+"Why does my UI feel choppy even though frames are fast?"
+```
+
+### Errors and logs
+```
+"Show me any errors in the last 10 seconds."
+"Watch the logs while I trigger the crash."
+"What HTTP requests is my app making?"
+```
+
+### Visual debugging
+```
+"Take a screenshot of my app."
+"Show me the widget tree."
+"Enable the performance overlay."
+```
+
+### General diagnosis
+```
+"My app is slow. Look at my screen and tell me what to do."
+"Run a complete health check on my app."
+"Why is my app using so much memory?"
+```
+
+> **Tip:** The AI will take a screenshot first to see your screen, then ask you to interact with the specific part that's slow before capturing data. This gives much more accurate results.
+
+---
+
+## Tools (28)
 
 ### Connection
 | Tool | Description |
@@ -150,6 +197,7 @@ Add to your project's `.claude/settings.json` or `~/.gemini/settings.json`:
 ### Performance
 | Tool | Description |
 |------|-------------|
+| `take_screenshot` | Capture current app screen as PNG — AI uses this to see your UI before giving specific guidance |
 | `capture_frame_timing` | Record frame times via Flutter.Frame stream, detect jank (>16ms), identify UI vs raster bottleneck |
 | `get_cpu_hotspots` | CPU profile — top Dart functions by self-time and call-chain cost, with fix suggestions |
 | `get_widget_rebuild_counts` | Track which widgets rebuild excessively with file:line context — the #1 cause of jank |

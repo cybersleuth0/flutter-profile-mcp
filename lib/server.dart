@@ -57,8 +57,12 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'capture_frame_timing',
         description:
-            'Record frame render times for N seconds and identify janky frames '
-            '(over 16ms at 60fps). Returns frame count, jank %, and worst frames.',
+            'Record frame render times and identify janky frames (over 16ms at 60fps). '
+            'WORKFLOW: 1) Call take_screenshot first to see the current screen. '
+            '2) Based on what you see, tell the user exactly what to do (e.g. "scroll this list", '
+            '"tap the chart button", "navigate to X screen"). '
+            '3) Then call this tool while user interacts. '
+            'Returns FPS, jank %, build/raster times per frame.',
         inputSchema: ObjectSchema(
           properties: {
             'duration_seconds':
@@ -75,8 +79,12 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_cpu_hotspots',
         description:
-            'Sample CPU usage and return top functions by self-time. '
-            'Identifies which Dart code consumes the most CPU.',
+            'Sample CPU usage and return top Dart functions by self-time. '
+            'WORKFLOW: 1) Call take_screenshot to see the current screen. '
+            '2) Ask user to use the feature they say is slow (e.g. "open the IPD chart", '
+            '"trigger the search", "play the animation"). '
+            '3) Then call this tool during that interaction. '
+            'Returns ranked Dart functions with CPU% — filters out native/VM code automatically.',
         inputSchema: ObjectSchema(
           properties: {
             'duration_seconds':
@@ -93,8 +101,13 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_widget_rebuild_counts',
         description:
-            'Track which widgets rebuild most often during user interaction. '
-            'Excessive rebuilds are the #1 cause of Flutter jank.',
+            'Track which widgets rebuild most often. Excessive rebuilds are the #1 cause of jank. '
+            'WORKFLOW: 1) Call take_screenshot to see the current screen. '
+            '2) Tell user to interact with the screen they say feels slow '
+            '(e.g. "scroll the list", "tap buttons", "switch tabs"). '
+            '3) Call this tool during that interaction. '
+            'Returns widget names with file:line, rebuild counts, and shared-parent analysis. '
+            'Requires debug mode.',
         inputSchema: ObjectSchema(
           properties: {
             'duration_seconds':
@@ -119,8 +132,11 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'analyze_jank_causes',
         description:
-            'Composite tool: captures frame timing + CPU profile together, '
-            'then returns a prioritized diagnosis of why the app is janky with fix suggestions.',
+            'Full jank diagnosis: frame timing + CPU profile in one call. '
+            'WORKFLOW: 1) Call take_screenshot to see the current screen. '
+            '2) Ask user: "Which part of the app feels slow? Please [scroll/tap/use] that feature now." '
+            '3) Call this tool during the interaction. '
+            'Returns: verdict box (HEALTHY/MINOR/SEVERE), FPS, jank%, top CPU functions, fix suggestions.',
         inputSchema: ObjectSchema(
           properties: {
             'duration_seconds':
@@ -481,6 +497,17 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       ),
       _handleDebugFrameEvents,
     );
+    registerTool(
+      Tool(
+        name: 'take_screenshot',
+        description:
+            'Capture a screenshot of the current Flutter app screen. '
+            'Returns a PNG image. Use this to visually inspect the UI, '
+            'identify what screen the user is on, or show before/after comparisons.',
+        inputSchema: ObjectSchema(properties: {}),
+      ),
+      _handleScreenshot,
+    );
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -539,8 +566,56 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       final vm = await _service!.getVM();
       _isolateId = vm.isolates!.first.id!;
       final ver = await _service!.getVersion();
-      return _ok(
-          'Connected. VM ${ver.major}.${ver.minor} | isolate: ${vm.isolates!.first.name} ($_isolateId)');
+
+      // Detect build mode
+      final isolate = await _service!.getIsolate(_isolateId!);
+      final exts = isolate.extensionRPCs ?? [];
+      final isDebug = exts.any((e) => e.contains('inspector'));
+      final mode = isDebug ? 'debug' : 'profile';
+
+      // Quick memory check
+      String memNote = '';
+      try {
+        final mem = await _service!.getMemoryUsage(_isolateId!);
+        final pct = (mem.heapUsage! / mem.heapCapacity! * 100).round();
+        final mb = (mem.heapUsage! / 1e6).toStringAsFixed(0);
+        if (pct > 85) {
+          memNote = '\n⚠ Memory: ${mb}MB (${pct}% of heap) — HIGH';
+        } else {
+          memNote = '\n✓ Memory: ${mb}MB (${pct}% of heap) — OK';
+        }
+      } catch (_) {}
+
+      final sb = StringBuffer();
+      sb.writeln('Connected. VM ${ver.major}.${ver.minor} | isolate: ${vm.isolates!.first.name} | mode: $mode$memNote');
+      sb.writeln('');
+      sb.writeln('━━ What you can do ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      sb.writeln('');
+      sb.writeln('🔍  take_screenshot');
+      sb.writeln('    → See current app screen. Do this first to understand what the user sees.');
+      sb.writeln('');
+      sb.writeln('📊  analyze_jank_causes  (duration_seconds: 6)');
+      sb.writeln('    → Full diagnosis: frames + CPU. Scroll the app during capture.');
+      sb.writeln('    → Tells you: is the problem UI thread, GPU, or both?');
+      sb.writeln('');
+      if (isDebug) {
+        sb.writeln('🔁  get_widget_rebuild_counts  (duration_seconds: 8)');
+        sb.writeln('    → Find widgets rebuilding too often. Interact with the app during capture.');
+        sb.writeln('    → Shows exact file:line so you know where to fix.');
+        sb.writeln('');
+      }
+      sb.writeln('🧠  get_memory_usage');
+      sb.writeln('    → Check heap usage and top memory consumers.');
+      sb.writeln('    → High string usage = JSON/API response not being freed.');
+      sb.writeln('');
+      sb.writeln('⚡  get_cpu_hotspots  (duration_seconds: 5)');
+      sb.writeln('    → Find slow Dart functions. Scroll/interact during capture.');
+      sb.writeln('');
+      if (!isDebug) {
+        sb.writeln('ℹ Profile mode: frame/CPU numbers are accurate. Widget rebuilds need debug mode.');
+      }
+
+      return _ok(sb.toString());
     } catch (e) {
       return _err(e);
     }
@@ -1744,6 +1819,54 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       }
 
       return _ok(sb.toString());
+    } catch (e) {
+      return _err(e);
+    }
+  }
+
+  Future<CallToolResult> _handleScreenshot(CallToolRequest req) async {
+    if (_service == null || _isolateId == null) return _notConnected();
+    try {
+      // Get root widget object ID via getRootWidgetSummaryTree
+      const groupName = 'screenshot_group';
+      final rootResult = await _service!.callServiceExtension(
+        'ext.flutter.inspector.getRootWidgetSummaryTree',
+        isolateId: _isolateId,
+        args: {'objectGroup': groupName},
+      );
+      final rootId = (rootResult.json?['result'] as Map<String, dynamic>?)?['valueId'] as String?;
+      if (rootId == null) {
+        return _ok('Screenshot failed: could not get root widget ID. Requires debug mode.');
+      }
+
+      // Use large canvas so any device/orientation fits — Flutter clips to actual render bounds
+      final result = await _service!.callServiceExtension(
+        'ext.flutter.inspector.screenshot',
+        isolateId: _isolateId,
+        args: {
+          'id': rootId,
+          'width': '2000',
+          'height': '4000',
+          'maxPixelRatio': '1.5',
+        },
+      );
+
+      // Dispose object group to avoid memory leak
+      await _service!.callServiceExtension(
+        'ext.flutter.inspector.disposeGroup',
+        isolateId: _isolateId,
+        args: {'objectGroup': groupName},
+      ).catchError((_) => Response());
+
+      final base64Data = (result.json?['result'] as String?);
+      if (base64Data == null || base64Data.isEmpty) {
+        return _ok('Screenshot returned empty data. Make sure app is visible on screen.');
+      }
+
+      return CallToolResult(content: [
+        ImageContent(data: base64Data, mimeType: 'image/png'),
+        TextContent(text: 'Screenshot captured. AI can now see the current app screen.'),
+      ]);
     } catch (e) {
       return _err(e);
     }
