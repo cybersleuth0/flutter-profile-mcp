@@ -9,8 +9,15 @@ class CpuAnalyzer {
       ..sort(
           (a, b) => (b.exclusiveTicks ?? 0).compareTo(a.exclusiveTicks ?? 0));
 
-    final user =
-        sorted.where((f) => !_isVmInternal(_functionName(f))).take(topN).toList();
+    // Filter: keep only Dart user code (non-empty resolvedUrl = has source location)
+    // Native/C/stub functions have empty resolvedUrl — same logic as Flutter DevTools
+    final user = sorted.where((f) {
+      final url = f.resolvedUrl ?? '';
+      if (url.isEmpty) return false;          // native, stub, VM internal
+      if (url.startsWith('dart:')) return false; // Dart SDK internals
+      if (url.contains('/flutter/')) return false; // Flutter framework
+      return true;
+    }).take(topN).toList();
 
     final windowSec =
         ((samples.timeExtentMicros ?? 0) / 1e6).toStringAsFixed(1);
@@ -58,29 +65,7 @@ class CpuAnalyzer {
     }
   }
 
-  String _functionName(ProfileFunction f) {
-    final fn = f.function;
-    if (fn == null) return '';
-    if (fn is Map) return fn['name'] as String? ?? '';
-    try { return (fn as dynamic).name as String? ?? ''; } catch (_) { return ''; }
-  }
 
-  bool _isVmInternal(String name) =>
-      name.isEmpty ||
-      name == '[Truncated]' ||
-      name == '[Native]' ||
-      name.startsWith('[Stub]') ||
-      name.startsWith('[NativeFunction') ||
-      name.startsWith('dart:') ||
-      name.startsWith('dart_') ||
-      name.startsWith('_CF') ||       // CoreFoundation C funcs
-      name.startsWith('objc_') ||     // ObjC runtime
-      name.startsWith('_objc_') ||
-      name.startsWith('_platform_') || // platform libc
-      name == 'madvise' ||
-      name == 'syscall' ||            // Linux/Android kernel syscall
-      name.startsWith('__') ||        // libc internals (__read, __write, etc.)
-      name.contains('::');            // C++ symbols
 
   String _advice(List<ProfileFunction> hot, int total) {
     final lines = <String>[];
