@@ -493,6 +493,23 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
   CallToolResult _ok(String text) =>
       CallToolResult(content: [TextContent(text: text)]);
 
+  String _fmtBytes(int bytes) {
+    if (bytes >= 1000000) return '${(bytes / 1e6).toStringAsFixed(2)} MB';
+    if (bytes >= 1000) return '${(bytes / 1000).toStringAsFixed(1)} KB';
+    return '$bytes B';
+  }
+
+  String _classLibraryUri(ClassHeapStats c) {
+    try {
+      final lib = (c.classRef as dynamic)?.library;
+      if (lib == null) return '';
+      final uri = lib.uri as String? ?? lib.toString();
+      return uri;
+    } catch (_) {
+      return '';
+    }
+  }
+
   CallToolResult _err(Object e) => CallToolResult(
         content: [TextContent(text: 'Error: $e')],
         isError: true,
@@ -654,17 +671,44 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       sb.writeln('');
       sb.writeln('Top classes by memory:');
 
-      final classes = (profile.members ?? [])
+      final allClasses = (profile.members ?? [])
         ..sort((a, b) =>
             (b.bytesCurrent ?? 0).compareTo(a.bytesCurrent ?? 0));
 
-      for (final c in classes.take(10)) {
+      // Split into user app classes and VM/framework classes
+      // classRef.library is @Library with .uri — user classes have package:appname/ URI
+      final userClasses = allClasses.where((c) {
+        final uri = _classLibraryUri(c);
+        if (uri.isEmpty) return false;
+        if (uri.startsWith('dart:')) return false;
+        if (uri.startsWith('org-dartlang')) return false;
+        if (uri.contains('packages/flutter/')) return false;
+        if (uri.startsWith('package:flutter')) return false;
+        return uri.startsWith('package:') || uri.startsWith('file:');
+      }).toList();
+
+      final vmClasses = allClasses.where((c) {
+        final bytes = c.bytesCurrent ?? 0;
+        return bytes > 0 && !userClasses.contains(c);
+      }).toList();
+
+      if (userClasses.isNotEmpty) {
+        sb.writeln('App classes (your code):');
+        for (final c in userClasses.take(10)) {
+          if ((c.bytesCurrent ?? 0) == 0) continue;
+          final name = c.classRef?.name ?? '?';
+          final inst = c.instancesCurrent ?? 0;
+          sb.writeln('  ${name.padRight(30)} $inst instances — ${_fmtBytes(c.bytesCurrent!)}');
+        }
+        sb.writeln('');
+      }
+
+      sb.writeln('Top VM/framework classes by size:');
+      for (final c in vmClasses.take(8)) {
         if ((c.bytesCurrent ?? 0) == 0) continue;
         final name = c.classRef?.name ?? '?';
-        final bytes = (c.bytesCurrent! / 1e6).toStringAsFixed(2);
         final inst = c.instancesCurrent ?? 0;
-        sb.writeln(
-            '  ${name.padRight(30)} $inst instances — $bytes MB');
+        sb.writeln('  ${name.padRight(30)} $inst instances — ${_fmtBytes(c.bytesCurrent!)}');
       }
 
       return _ok(sb.toString());

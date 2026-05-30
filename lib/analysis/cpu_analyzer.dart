@@ -9,13 +9,27 @@ class CpuAnalyzer {
       ..sort(
           (a, b) => (b.exclusiveTicks ?? 0).compareTo(a.exclusiveTicks ?? 0));
 
-    // Filter: keep only Dart user code (non-empty resolvedUrl = has source location)
-    // Native/C/stub functions have empty resolvedUrl — same logic as Flutter DevTools
+    // Filter: keep only Dart user code
+    // Dart source files have resolvedUrl like "package:foo/bar.dart" or "file:///...dart"
+    // Native frames on Android have resolvedUrl like "/data/app/.../libflutter.so+0x..."
+    // Native frames on iOS have empty resolvedUrl or native lib paths
     final user = sorted.where((f) {
       final url = f.resolvedUrl ?? '';
-      if (url.isEmpty) return false;          // native, stub, VM internal
-      if (url.startsWith('dart:')) return false; // Dart SDK internals
-      if (url.contains('/flutter/')) return false; // Flutter framework
+      final name = _formatName(f);
+      // Bracket notation = VM internal/native regardless of URL
+      if (name.startsWith('[')) return false;
+      // Must have a Dart source URL
+      if (url.isEmpty) return false;
+      if (!url.endsWith('.dart')) return false; // .so, .dylib, empty = not Dart
+      // Skip SDK internals
+      if (url.startsWith('dart:')) return false;
+      if (url.startsWith('org-dartlang-sdk:')) return false; // AOT compiled SDK
+      if (url.contains('org-dartlang-sdk')) return false;
+      // Skip Flutter framework (keep app code)
+      if (url.contains('packages/flutter/')) return false;
+      if (url.contains('pub.dartlang.org')) return false;
+      // Only keep app package code
+      if (!url.contains('package:') && !url.startsWith('file:')) return false;
       return true;
     }).take(topN).toList();
 
