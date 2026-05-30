@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.6
+
+- Add take_screenshot tool — AI sees app screen before giving interaction guidance
+- connect_to_app now shows memory health + guided tool menu on connect
+- Android support: CPU profiler enable, scheduleFrame for frame timing
+- CPU filter: resolvedUrl-based — works on iOS, Android, emulator without platform hacks
+- Memory: show app classes (KB) separately from VM/framework classes — matches DevTools
+- Tool descriptions include screenshot-first workflow for performance tools
+- README: real user prompts guide
+
 ## 1.0.5
 
 - Add pub.dev topics for discoverability
