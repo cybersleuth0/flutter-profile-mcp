@@ -584,12 +584,16 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 2;
       final topN = (req.arguments?['top_n'] as num?)?.toInt() ?? 10;
 
+      // Ensure profiler running — required on Android
+      await _service!.setFlag('profiler', 'true').catchError((_) => Success());
+
       final t0 = (await _service!.getVMTimelineMicros()).timestamp!;
       await Future.delayed(Duration(seconds: dur));
       final t1 = (await _service!.getVMTimelineMicros()).timestamp!;
+      // Clamp: if VM clock returned same value (Android emulator edge case), use dur
+      final extent = t1 > t0 ? t1 - t0 : dur * 1000000;
 
-      final samples =
-          await _service!.getCpuSamples(_isolateId!, t0, t1 - t0);
+      final samples = await _service!.getCpuSamples(_isolateId!, t0, extent);
       return _ok(_cpu.generateHotspotReport(samples, topN: topN));
     } catch (e) {
       return _err(e);

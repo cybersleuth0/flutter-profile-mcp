@@ -35,6 +35,13 @@ class JankAnalyzer {
     final frames = <FrameData>[];
 
     await service.streamListen(EventStreams.kExtension).catchError((_) => Success());
+
+    // Kick engine to produce frames — needed on Android/emulator when app is idle
+    await service.callServiceExtension(
+      'ext.ui.window.scheduleFrame',
+      isolateId: isolateId,
+    ).catchError((_) => Response());
+
     final sub = service.onExtensionEvent.listen((event) {
       if (event.extensionKind != 'Flutter.Frame') return;
       final data = event.extensionData?.data ?? event.json;

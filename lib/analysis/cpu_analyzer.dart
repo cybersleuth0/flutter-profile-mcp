@@ -78,6 +78,8 @@ class CpuAnalyzer {
       name.startsWith('_objc_') ||
       name.startsWith('_platform_') || // platform libc
       name == 'madvise' ||
+      name == 'syscall' ||            // Linux/Android kernel syscall
+      name.startsWith('__') ||        // libc internals (__read, __write, etc.)
       name.contains('::');            // C++ symbols
 
   String _advice(List<ProfileFunction> hot, int total) {
