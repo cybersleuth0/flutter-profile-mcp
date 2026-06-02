@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.7
+
+- Beginner UX: run_health_check, my_app_feels_slow, app_uses_too_much_memory, help tools
+- Rich instructions field guides AI tool selection automatically
+- _nextSteps() hints in frame timing output
+- _friendlyError() with human-readable connection error messages
+- Tool descriptions rewritten: symptom-first "Use this when..." pattern
+- Simplified connect output: 2-line guide instead of full menu
+- README rewritten: problem-first, real example, what-to-say table
+
 ## 1.0.6
 
 - Add take_screenshot tool — AI sees app screen before giving interaction guidance

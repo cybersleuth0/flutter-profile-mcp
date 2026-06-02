@@ -19,8 +19,15 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
             version: '0.1.0',
           ),
           instructions:
-              'Query a running Flutter app for performance data. '
-              'Call connect_to_app first with the VM service URI printed by flutter run.',
+              'This server connects to a running Flutter app via the Dart VM service and exposes performance, memory, and debugging tools. '
+              'ALWAYS call connect_to_app first before any other tool — it requires the ws:// URI printed by flutter run. '
+              'ALWAYS call take_screenshot before performance tools so you can see the current screen and tell the user exactly what to interact with. '
+              'When the user says their app is slow, laggy, stutters, or drops frames — call my_app_feels_slow. '
+              'When the user says memory is high, the app crashes with OOM, or RAM keeps growing — call app_uses_too_much_memory. '
+              'When unsure where to start or user has no specific complaint — call run_health_check. It combines screenshot, FPS, and memory in one call. '
+              'Performance tools (capture_frame_timing, get_cpu_hotspots, get_widget_rebuild_counts, analyze_jank_causes) require the user to interact with the app during the capture window. '
+              'Always tell the user what to do BEFORE calling these tools: "Please scroll the list / tap the button / open the chart now." '
+              'Call help to see all tools grouped by problem category.',
         );
 
   VmService? _service;
@@ -57,11 +64,11 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'capture_frame_timing',
         description:
-            'Record frame render times and identify janky frames (over 16ms at 60fps). '
+            'Use this when your app scrolls or animates with stutter. '
+            'Tells you how smooth your frames are and which ones were too slow. '
             'WORKFLOW: 1) Call take_screenshot first to see the current screen. '
-            '2) Based on what you see, tell the user exactly what to do (e.g. "scroll this list", '
-            '"tap the chart button", "navigate to X screen"). '
-            '3) Then call this tool while user interacts. '
+            '2) Tell the user exactly what to do ("scroll this list", "tap the chart button"). '
+            '3) Call this tool while user interacts. '
             'Returns FPS, jank %, build/raster times per frame.',
         inputSchema: ObjectSchema(
           properties: {
@@ -79,11 +86,11 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_cpu_hotspots',
         description:
-            'Sample CPU usage and return top Dart functions by self-time. '
+            'Use this if a specific gesture or screen feels slow to respond. '
+            'Shows which of your Dart functions is eating the most CPU. '
             'WORKFLOW: 1) Call take_screenshot to see the current screen. '
-            '2) Ask user to use the feature they say is slow (e.g. "open the IPD chart", '
-            '"trigger the search", "play the animation"). '
-            '3) Then call this tool during that interaction. '
+            '2) Ask user to use the feature they say is slow ("open the chart", "trigger the search"). '
+            '3) Call this tool during that interaction. '
             'Returns ranked Dart functions with CPU% — filters out native/VM code automatically.',
         inputSchema: ObjectSchema(
           properties: {
@@ -101,12 +108,12 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_widget_rebuild_counts',
         description:
-            'Track which widgets rebuild most often. Excessive rebuilds are the #1 cause of jank. '
+            'Use this if your list or animation stutters even though nothing seems wrong. '
+            'Excessive widget rebuilds are the #1 hidden cause of jank — this finds them. '
             'WORKFLOW: 1) Call take_screenshot to see the current screen. '
-            '2) Tell user to interact with the screen they say feels slow '
-            '(e.g. "scroll the list", "tap buttons", "switch tabs"). '
+            '2) Tell user to interact with the slow screen ("scroll the list", "switch tabs"). '
             '3) Call this tool during that interaction. '
-            'Returns widget names with file:line, rebuild counts, and shared-parent analysis. '
+            'Returns widget names with file:line, rebuild counts, shared-parent analysis. '
             'Requires debug mode.',
         inputSchema: ObjectSchema(
           properties: {
@@ -122,7 +129,9 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_memory_usage',
         description:
-            'Get current heap memory usage and the top classes by allocation size.',
+            'Use this when your app feels sluggish over time or uses a lot of RAM. '
+            'Shows current heap size and which classes are using the most memory. '
+            'No interaction needed — just run it.',
         inputSchema: ObjectSchema(properties: {}),
       ),
       _handleMemory,
@@ -151,7 +160,11 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_http_profile',
         description:
-            'List recent HTTP requests made by the app with method, status, timing, and size.',
+            'List recent HTTP requests made by the app with method, status, timing, and size. '
+            'HTTP logging is auto-enabled on connect_to_app. '
+            'Works with dart:io HttpClient and IOClient. '
+            'If empty, the app may use package:http without IOClient wrapper — '
+            'in that case use watch_logs with an HTTP filter instead.',
         inputSchema: ObjectSchema(
           properties: {
             'limit': NumberSchema(
@@ -410,7 +423,9 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
         name: 'watch_network',
         description:
             'Live-stream new HTTP requests as they happen for N seconds. '
-            'Useful for catching the slow API call in real time during interaction.',
+            'Same limitation as get_http_profile: only captures requests made via dart:io HttpClient. '
+            'Apps using package:http may show no results. '
+            'If empty, suggest user wraps http.Client with IOClient, or use watch_logs with filter.',
         inputSchema: ObjectSchema(
           properties: {
             'duration_seconds':
@@ -508,6 +523,52 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       ),
       _handleScreenshot,
     );
+    // ── Beginner-friendly aliases ─────────────────────────────────────────
+    registerTool(
+      Tool(
+        name: 'run_health_check',
+        description:
+            'Start here if you have no idea what is wrong. '
+            'Takes a screenshot, checks frame rate, and checks memory — all in one call. '
+            'Returns a plain-English health report and tells you exactly what to do next. '
+            'Interact with your app while this runs.',
+        inputSchema: ObjectSchema(properties: {}),
+      ),
+      _handleHealthCheck,
+    );
+    registerTool(
+      Tool(
+        name: 'my_app_feels_slow',
+        description:
+            'Use this when your app scrolls, animates, or responds slowly. '
+            'No setup needed — just run this and interact with the slow part of your app. '
+            'Returns: how fast your frames are, what is causing the slowdown, and what to fix.',
+        inputSchema: ObjectSchema(properties: {}),
+      ),
+      (req) => _handleJankDiagnosis(CallToolRequest(
+          name: 'analyze_jank_causes', arguments: {'duration_seconds': 6})),
+    );
+    registerTool(
+      Tool(
+        name: 'app_uses_too_much_memory',
+        description:
+            'Use this when your app crashes with out-of-memory, or RAM keeps growing over time. '
+            'Automatically runs GC twice and finds what is being retained between cycles. '
+            'Use your app normally while this runs.',
+        inputSchema: ObjectSchema(properties: {}),
+      ),
+      (req) => _handleFindLeaks(CallToolRequest(
+          name: 'find_memory_leaks', arguments: {'observe_seconds': 5})),
+    );
+    registerTool(
+      Tool(
+        name: 'help',
+        description: 'List all available tools grouped by the problem you are trying to solve. '
+            'Use this if you are not sure which tool to run.',
+        inputSchema: ObjectSchema(properties: {}),
+      ),
+      _handleHelp,
+    );
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -519,6 +580,34 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
 
   CallToolResult _ok(String text) =>
       CallToolResult(content: [TextContent(text: text)]);
+
+  String _nextSteps(List<String> steps) {
+    if (steps.isEmpty) return '';
+    final sb = StringBuffer('\n\n→ What to do next:\n');
+    for (final s in steps) sb.writeln('  • $s');
+    return sb.toString();
+  }
+
+  CallToolResult _friendlyError(Object e) {
+    final msg = e.toString();
+    if (msg.contains('Connection refused') || msg.contains('SocketException')) {
+      return _err('Could not connect to the app.\n'
+          'Fix: Make sure "flutter run" is still running and the URI is correct.\n'
+          'The URI looks like: ws://127.0.0.1:PORT/TOKEN=/ws\n'
+          'Original error: $msg');
+    }
+    if (msg.contains('No isolate') || msg.contains('Service connection disposed')) {
+      return _err('Lost connection to the app — it may have been restarted.\n'
+          'Fix: Call connect_to_app again with the new URI from flutter run.\n'
+          'Original: $msg');
+    }
+    if (msg.contains('extension not found') || msg.contains('RPCError')) {
+      return _err('This feature requires debug mode.\n'
+          'Fix: Run "flutter run" without --profile or --release.\n'
+          'Original: $msg');
+    }
+    return _err(msg);
+  }
 
   String _fmtBytes(int bytes) {
     if (bytes >= 1000000) return '${(bytes / 1e6).toStringAsFixed(2)} MB';
@@ -565,13 +654,18 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       _service = await vmServiceConnectUri(wsUri);
       final vm = await _service!.getVM();
       _isolateId = vm.isolates!.first.id!;
-      final ver = await _service!.getVersion();
-
       // Detect build mode
       final isolate = await _service!.getIsolate(_isolateId!);
       final exts = isolate.extensionRPCs ?? [];
       final isDebug = exts.any((e) => e.contains('inspector'));
       final mode = isDebug ? 'debug' : 'profile';
+
+      // Auto-enable HTTP timeline logging so get_http_profile captures requests immediately
+      await _service!.callServiceExtension(
+        'ext.dart.io.httpEnableTimelineLogging',
+        isolateId: _isolateId,
+        args: {'enabled': true},
+      ).catchError((_) => Response());
 
       // Quick memory check
       String memNote = '';
@@ -587,37 +681,21 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       } catch (_) {}
 
       final sb = StringBuffer();
-      sb.writeln('Connected. VM ${ver.major}.${ver.minor} | isolate: ${vm.isolates!.first.name} | mode: $mode$memNote');
+      sb.writeln('Connected ✓  ($mode mode | ${vm.isolates!.first.name})$memNote');
       sb.writeln('');
-      sb.writeln('━━ What you can do ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      sb.writeln('Best starting point:');
+      sb.writeln('  1. run_health_check       → screenshot + FPS + memory in one call');
+      sb.writeln('  2. my_app_feels_slow      → full jank diagnosis (interact during capture)');
       sb.writeln('');
-      sb.writeln('🔍  take_screenshot');
-      sb.writeln('    → See current app screen. Do this first to understand what the user sees.');
-      sb.writeln('');
-      sb.writeln('📊  analyze_jank_causes  (duration_seconds: 6)');
-      sb.writeln('    → Full diagnosis: frames + CPU. Scroll the app during capture.');
-      sb.writeln('    → Tells you: is the problem UI thread, GPU, or both?');
-      sb.writeln('');
-      if (isDebug) {
-        sb.writeln('🔁  get_widget_rebuild_counts  (duration_seconds: 8)');
-        sb.writeln('    → Find widgets rebuilding too often. Interact with the app during capture.');
-        sb.writeln('    → Shows exact file:line so you know where to fix.');
-        sb.writeln('');
-      }
-      sb.writeln('🧠  get_memory_usage');
-      sb.writeln('    → Check heap usage and top memory consumers.');
-      sb.writeln('    → High string usage = JSON/API response not being freed.');
-      sb.writeln('');
-      sb.writeln('⚡  get_cpu_hotspots  (duration_seconds: 5)');
-      sb.writeln('    → Find slow Dart functions. Scroll/interact during capture.');
-      sb.writeln('');
+      sb.writeln('Type help to see all tools grouped by problem.');
       if (!isDebug) {
-        sb.writeln('ℹ Profile mode: frame/CPU numbers are accurate. Widget rebuilds need debug mode.');
+        sb.writeln('');
+        sb.writeln('ℹ Profile mode: accurate perf numbers. Widget rebuilds need debug mode (flutter run without --profile).');
       }
 
       return _ok(sb.toString());
     } catch (e) {
-      return _err(e);
+      return _friendlyError(e);
     }
   }
 
@@ -634,7 +712,12 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       if (frames.isNotEmpty) {
         final report =
             _jank.generateReport(frames, targetFps: fps, fromFrameTimings: true);
-        return _ok(report);
+        final jankPct = frames.where((f) => f.isJanky(targetFps: fps)).length / frames.length * 100;
+        final hints = <String>[];
+        if (jankPct > 10) hints.add('Run get_widget_rebuild_counts (duration_seconds: 8) — excessive rebuilds are the #1 cause');
+        if (jankPct > 10) hints.add('Run get_cpu_hotspots (duration_seconds: 5) — find the slow Dart function');
+        if (jankPct < 5) hints.add('Frames look good. Run get_memory_usage to check heap health.');
+        return _ok('$report${_nextSteps(hints)}');
       }
 
       // Fallback: parse raw timeline (profile mode or extension stream unavailable)
@@ -1870,6 +1953,98 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
     } catch (e) {
       return _err(e);
     }
+  }
+
+  Future<CallToolResult> _handleHelp(CallToolRequest req) async {
+    return _ok('''
+What problem are you solving?
+
+━ MY APP FEELS SLOW / LAGGY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  my_app_feels_slow           → Start here (auto-diagnosis, 6s)
+  capture_frame_timing        → Raw FPS + jank %
+  get_cpu_hotspots            → Which Dart functions are slow
+  get_widget_rebuild_counts   → Which widgets rebuild too often (debug mode)
+  enable_performance_overlay  → Show FPS bars on device screen
+
+━ MY APP USES TOO MUCH MEMORY ━━━━━━━━━━━━━━━━━━━━━━━━━━
+  app_uses_too_much_memory    → Start here (auto leak detection)
+  get_memory_usage            → Current heap snapshot with class breakdown
+  find_memory_leaks           → GC-confirmed leak detection
+  diff_memory_snapshots       → What grew between two snapshots
+  explain_memory_breakdown    → What RSS/heap/external mean in plain English
+
+━ I WANT TO SEE WHAT IS HAPPENING ━━━━━━━━━━━━━━━━━━━━━━
+  run_health_check            → Screenshot + FPS + memory in one call
+  take_screenshot             → See current screen as image
+  watch_logs                  → Live console output
+  get_error_logs              → Only errors/exceptions
+  watch_network               → Live HTTP requests
+  get_widget_tree             → Widget hierarchy
+
+━ I WANT TO CHANGE SOMETHING ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  hot_reload                  → Apply code changes instantly
+  toggle_visual_debug         → Widget bounds / repaint overlay
+  eval_expression             → Run Dart code in the live app
+━ SETUP ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  connect_to_app              → Connect using URI from flutter run
+  get_app_info                → App version, mode, registered extensions
+''');
+  }
+
+  Future<CallToolResult> _handleHealthCheck(CallToolRequest req) async {
+    if (_service == null || _isolateId == null) return _notConnected();
+
+    final sb = StringBuffer();
+    sb.writeln('Running health check — interact with your app now...\n');
+
+    // Screenshot
+    final shot = await _handleScreenshot(req);
+
+    // Frame timing (3s)
+    final jankResult = await _handleFrameTiming(CallToolRequest(
+        name: 'capture_frame_timing', arguments: {'duration_seconds': 3}));
+
+    // Memory
+    final memResult = await _handleMemory(req);
+
+    final jankTxt = (jankResult.content.first as TextContent).text;
+    final memTxt = (memResult.content.first as TextContent).text;
+
+    // Parse key numbers
+    final fpsMatch = RegExp(r'~([\d.]+) fps').firstMatch(jankTxt);
+    final jankMatch = RegExp(r'Janky: \d+/\d+ \(([\d.]+)%\)').firstMatch(jankTxt);
+    final heapMatch = RegExp(r'([\d.]+) MB heap \((\d+)%').firstMatch(memTxt);
+
+    final fps = fpsMatch?.group(1) ?? '?';
+    final jankPct = double.tryParse(jankMatch?.group(1) ?? '0') ?? 0.0;
+    final heapPct = int.tryParse(heapMatch?.group(2) ?? '0') ?? 0;
+    final heapMb = heapMatch?.group(1) ?? '?';
+
+    final fpsStatus = jankPct < 5 ? '✓ Good' : jankPct < 20 ? '⚠ Minor jank' : '✗ Janky';
+    final memStatus = heapPct > 80 ? '⚠ High' : '✓ OK';
+
+    sb.writeln('┌─ HEALTH REPORT ────────────────────────────────────┐');
+    sb.writeln('│ FPS    : $fps fps  $fpsStatus');
+    sb.writeln('│ Jank   : ${jankPct.toStringAsFixed(1)}%  ${jankPct < 5 ? '' : '← needs attention'}');
+    sb.writeln('│ Memory : $heapMb MB (${heapPct}% of heap)  $memStatus');
+    sb.writeln('└─────────────────────────────────────────────────────┘');
+    sb.writeln('');
+
+    if (jankPct > 20) {
+      sb.writeln('SEVERE JANK detected. Run: my_app_feels_slow');
+      sb.writeln('Scroll/interact with the slow part of the app while it captures.');
+    } else if (jankPct > 5) {
+      sb.writeln('Minor jank detected. Run: get_widget_rebuild_counts (duration_seconds: 8)');
+      sb.writeln('Interact with the app during capture to find excessive rebuilds.');
+    } else if (heapPct > 80) {
+      sb.writeln('Memory pressure detected. Run: app_uses_too_much_memory');
+      sb.writeln('Use the app normally while it runs — takes ~10 seconds.');
+    } else {
+      sb.writeln('App looks healthy! If something specific feels slow, run: my_app_feels_slow');
+    }
+
+    final contents = [...shot.content, TextContent(text: sb.toString())];
+    return CallToolResult(content: contents);
   }
 
   Future<CallToolResult> _handleDebugFrameEvents(CallToolRequest req) async {
