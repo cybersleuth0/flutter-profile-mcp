@@ -6,6 +6,12 @@
 
 ---
 
+## Demo
+
+▶ [Watch: AI diagnoses a slow Flutter app in real time](https://github.com/cybersleuth0/flutter-profile-mcp/blob/main/assets/demo.mp4)
+
+---
+
 ## What is this?
 
 Flutter DevTools shows you the data. This package makes the AI **understand** it.
