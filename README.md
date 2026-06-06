@@ -8,7 +8,9 @@
 
 ## Demo
 
-▶ [Watch: AI diagnoses a slow Flutter app in real time](https://github.com/cybersleuth0/flutter-profile-mcp/blob/main/assets/demo.mp4)
+[![Demo](https://raw.githubusercontent.com/cybersleuth0/flutter-profile-mcp/main/assets/demo_preview.gif)](https://github.com/cybersleuth0/flutter-profile-mcp/blob/main/assets/demo.mp4)
+
+*Click to watch full video*
 
 ---
 
