@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.8
+
+- Add animated GIF demo preview to README
+- Demo video linked from GitHub
+
 ## 1.0.7
 
 - Beginner UX: run_health_check, my_app_feels_slow, app_uses_too_much_memory, help tools
