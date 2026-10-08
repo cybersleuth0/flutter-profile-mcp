@@ -26,14 +26,14 @@ You:   "My app feels slow when I scroll."
 AI:    [takes screenshot — sees your product list screen]
        I can see a scrollable list. Please scroll it up and down now...
 
-       [captures 6 seconds of frame data + CPU]
+       [captures 5 seconds of frames + CPU together]
 
-       ┌─ JANK DIAGNOSIS ──────────────────────────┐
-       │ ✗ SEVERE — 100% frames over budget         │
-       │   PRIMARY: _FeedScreenState._buildItem      │
-       └────────────────────────────────────────────┘
+       ┌─ JANK DIAGNOSIS (5s, frames + CPU captured together)
+       │ ✗ SEVERE JANK — 34.0% frames over budget, 52.1fps
+       │   TOP CPU: _FeedScreenState._buildItem (41.3% self)
+       └──────────────────────────────────────────────
 
-       95.8% of CPU is spent in _buildItem().
+       41% of CPU is spent in your _buildItem().
        This function is running expensive work inside build().
        Fix: move heavy computation outside build() or use compute().
 ```
@@ -93,11 +93,13 @@ Restart your AI client after editing.
 1. Run your Flutter app: `flutter run`
 2. Copy the VM service URI printed in the terminal — looks like:
    ```
-   An Observatory debugger and profiler on iPhone is available at:
-   ws://127.0.0.1:PORT/TOKEN=/ws
+   A Dart VM Service on Pixel 9 is available at: http://127.0.0.1:51438/u0hZrUtJpIA=/
    ```
+   `http://`, `ws://` and DevTools links all work.
 3. Tell your AI: **"Connect to my Flutter app at `<paste URI here>`"**
 4. The AI connects, takes a screenshot, and guides you from there.
+
+If the app restarts or the connection drops, the server reconnects to the same URI automatically.
 
 ---
 
@@ -122,39 +124,57 @@ You don't need to know any tool names. Just describe the problem:
 ## Requirements
 
 - Flutter app running in **debug or profile mode**
-  - Debug: `flutter run` — all features including widget rebuild tracking
-  - Profile: `flutter run --profile` — more accurate performance numbers
+  - Debug: `flutter run` — every tool works. Timings are inflated (JIT, asserts); results say so.
+  - Profile: `flutter run --profile` on a **physical device** — real performance numbers. Emulators can't run profile builds.
   - Release: **not supported** — VM service is unavailable
-- Dart SDK ≥ 3.4.0
+- Dart SDK ≥ 3.7.0 (to run the server)
 - Any MCP-compatible AI (Claude Desktop, Claude Code, Gemini CLI, Cursor, etc.)
 
 ---
 
-## What the AI can check
+## Tools (18)
+
+**Mode:** Both = debug or profile. Debug = needs `flutter run` without `--profile`; in profile mode these tools say so instead of failing silently.
+
+### Setup
+| Tool | What it does | Mode |
+|---|---|---|
+| `connect_to_app` | Connect to the running app (auto-reconnects) | Both |
+| `get_app_info` | Dart/VM version, build mode, platform, service extensions | Both |
+| `list_isolates` | Isolates (main + background workers) with their heap | Both |
 
 ### Performance
-| Problem | Tool used by AI |
-|---------|----------------|
-| Is my app janky? | `analyze_jank_causes` → frames + CPU diagnosis |
-| Which functions are slow? | `get_cpu_hotspots` |
-| Which widgets rebuild too often? | `get_widget_rebuild_counts` (debug mode) |
-| What does my UI look like right now? | `take_screenshot` |
-| Full performance report | `run_health_check` |
+| Tool | What it does | Mode |
+|---|---|---|
+| `analyze_jank_causes` | **Start here when it's slow.** Frames + CPU over the same window → HEALTHY / MINOR / SEVERE / INSUFFICIENT DATA | Both |
+| `capture_frame_timing` | FPS, jank %, worst frames split into build vs raster | Both |
+| `get_cpu_hotspots` | Hot functions, split into your code / dependencies / Flutter framework | Both |
+| `get_widget_rebuild_counts` | Most-rebuilt widgets with file:line, rebuilds/sec, widgets sharing a parent | Debug |
+| `run_health_check` | Screenshot + FPS + memory in one call, with next step | Both |
 
 ### Memory
-| Problem | Tool used by AI |
-|---------|----------------|
-| How much memory is my app using? | `get_memory_usage` |
-| Is something leaking? | `find_memory_leaks` |
-| Is GC thrashing? | `get_memory_timeline` |
+| Tool | What it does | Mode |
+|---|---|---|
+| `find_memory_leaks` | **Start here when memory grows.** GC → wait → GC → classes still growing, your code first | Both |
+| `get_memory_usage` | Heap, external memory, top classes split into yours / dependencies / framework | Both |
+| `get_memory_timeline` | Heap delta and GC rate over N seconds | Both |
+| `get_class_instances` | Count and size of classes matching a name | Both |
 
 ### Debugging
-| Problem | Tool used by AI |
-|---------|----------------|
-| Any errors in the last N seconds? | `watch_logs` (errors_only) — includes widget file:line |
-| What's the app printing? | `watch_logs` |
-| Show me the widget tree | `get_widget_tree` |
-| Apply my code changes | `hot_reload` |
+| Tool | What it does | Mode |
+|---|---|---|
+| `watch_logs` | `print`/`debugPrint`, `log()`, and Flutter errors with the widget's file:line. `errors_only` for crashes | Both |
+| `take_screenshot` | Current screen as an image, so the AI can see it | Debug |
+| `get_widget_tree` | Widget hierarchy; single-child wrapper chains joined on one line | Debug |
+| `eval_expression` | Evaluate Dart in the live app | Debug |
+| `hot_reload` | Apply code changes via `flutter run` | Debug |
+| `toggle_visual_debug` | Debug paint, repaint rainbow, performance overlay | Debug (overlay: Both) |
+
+### Hands-free capture on Android
+`analyze_jank_causes`, `capture_frame_timing` and `get_widget_rebuild_counts` accept `auto_scroll: true` — the server swipes the screen via `adb` during the capture, so results are repeatable without a human. Requires `adb` on PATH. With several devices attached, set `ANDROID_SERIAL` in the MCP server's env:
+```json
+"flutter-profile": { "command": "flutter-profile-mcp", "env": { "ANDROID_SERIAL": "emulator-5554" } }
+```
 
 ---
 
@@ -200,6 +220,19 @@ Then point your config to the compiled binary path.
 `capture_frame_timing` uses Flutter's `Flutter.Frame` extension event stream — the same source as Flutter DevTools' Performance tab.
 
 **Important:** A frame is janky when its build time **or** its raster time exceeds the budget — the same rule as DevTools. The UI and raster threads run in parallel, so their times are not added. `elapsed` is not used: it includes vsync idle time (~16ms at 60fps), which would make every frame look janky.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Could not reach the app` | `flutter run` stopped or restarted — the URI changes every run. Copy the new one. The `port =` in a SocketException is your local port, not the app's. |
+| `Hot reload unavailable` | Hot reload goes through `flutter run`. Start the app with `flutter run` (debug) and connect to the URI it printed. |
+| `needs debug mode` | That tool uses the widget inspector, which profile builds don't have. Performance and memory tools still work. |
+| `INSUFFICIENT DATA` | Under 30 frames rendered — Flutter only draws when something changes. Scroll/animate during the capture, or use `auto_scroll` on Android. |
+| `flutter run` hangs after install on some Android phones (seen on Vivo) | The phone masks the VM service URL in its logs (`listening on ****`). Run with `--disable-service-auth-codes`, find the app's listening port (`adb shell cat /proc/net/tcp`, state `0A`), then `adb forward tcp:PORT tcp:PORT` and connect to `http://127.0.0.1:PORT/`. Hot reload is unavailable this way. |
+| Raster times of 30–50ms on an emulator | Emulator GPU, not real jank. Confirm with `flutter run --profile` on a physical device. |
 
 ---
 
