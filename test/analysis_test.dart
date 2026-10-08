@@ -1,6 +1,5 @@
 import 'package:flutter_profile_mcp/analysis/cpu_analyzer.dart';
 import 'package:flutter_profile_mcp/analysis/jank_analyzer.dart';
-import 'package:flutter_profile_mcp/server.dart';
 import 'package:test/test.dart';
 
 List<FrameData> frames(int n, {int buildMicros = 4000}) => [
@@ -51,18 +50,6 @@ void main() {
     expect(codeOrigin('file:///Users/x/flutter/packages/flutter/lib/src/widgets/framework.dart', app), CodeOrigin.sdk);
     expect(codeOrigin('org-dartlang-sdk:///flutter/third_party/dart/sdk/lib/collection/list.dart', app), CodeOrigin.sdk);
     expect(codeOrigin('/data/app/lib/arm64/libflutter.so+0x1234', app), CodeOrigin.sdk);
-  });
-
-  test('credentials are redacted before reaching the AI', () {
-    expect(redactHeader('Authorization', ['Bearer abc']), '[redacted]');
-    expect(redactHeader('content-type', ['application/json']), ['application/json']);
-    final body = redactBody('{"email":"a@b.com","password": "hunter2","idToken":"xyz","spinCount":3,"pin":"1234"}');
-    expect(body, isNot(contains('hunter2')));
-    expect(body, isNot(contains('xyz')));
-    expect(body, isNot(contains('1234')));
-    expect(body, contains('a@b.com'));
-    expect(body, contains('"spinCount":3'));
-    expect(redactBody('user=bob&password=hunter2&access_token=t'), 'user=bob&password=[redacted]&access_token=[redacted]');
   });
 
   test('jank = slower thread over budget, not build + raster', () {

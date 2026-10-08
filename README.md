@@ -114,7 +114,6 @@ You don't need to know any tool names. Just describe the problem:
 | General check | `"Run a health check on my app."` |
 | See current screen | `"Take a screenshot of my app."` |
 | Find errors | `"Show me any crashes or errors in the last 10 seconds."` |
-| Watch network | `"What HTTP requests is my app making right now?"` |
 
 > **How it works:** The AI takes a screenshot first so it can see what's on your screen. Then it asks you to interact with the slow part of your app while it captures data. This gives much more accurate results than just running blindly.
 
@@ -154,7 +153,6 @@ You don't need to know any tool names. Just describe the problem:
 |---------|----------------|
 | Any errors in the last N seconds? | `watch_logs` (errors_only) — includes widget file:line |
 | What's the app printing? | `watch_logs` |
-| What HTTP calls is the app making? | `get_http_profile` (watch_seconds for live) |
 | Show me the widget tree | `get_widget_tree` |
 | Apply my code changes | `hot_reload` |
 
