@@ -16,22 +16,29 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
           channel,
           implementation: Implementation(
             name: 'flutter_devtools_mcp',
-            version: '0.1.0',
+            version: '1.1.0',
           ),
           instructions:
               'This server connects to a running Flutter app via the Dart VM service and exposes performance, memory, and debugging tools. '
               'ALWAYS call connect_to_app first before any other tool — it requires the ws:// URI printed by flutter run. '
               'ALWAYS call take_screenshot before performance tools so you can see the current screen and tell the user exactly what to interact with. '
-              'When the user says their app is slow, laggy, stutters, or drops frames — call my_app_feels_slow. '
-              'When the user says memory is high, the app crashes with OOM, or RAM keeps growing — call app_uses_too_much_memory. '
+              'When the user says their app is slow, laggy, stutters, or drops frames — call analyze_jank_causes. '
+              'When the user says memory is high, the app crashes with OOM, or RAM keeps growing — call find_memory_leaks. '
               'When unsure where to start or user has no specific complaint — call run_health_check. It combines screenshot, FPS, and memory in one call. '
               'Performance tools (capture_frame_timing, get_cpu_hotspots, get_widget_rebuild_counts, analyze_jank_causes) require the user to interact with the app during the capture window. '
               'Always tell the user what to do BEFORE calling these tools: "Please scroll the list / tap the button / open the chart now." '
-              'Call help to see all tools grouped by problem category.',
+              'On Android, pass auto_scroll: true to drive scrolling without a human.',
         );
 
   VmService? _service;
   String? _isolateId;
+  String? _wsUri; // last good URI — reused for auto-reconnect
+  String? _reconnectError;
+  bool _isDebug = true;
+  String _os = '';
+  String? _appPackage; // e.g. package:my_app/ — separates your code from dependencies
+  // Services registered on the VM by the Flutter tool, e.g. reloadSources → s0.reloadSources
+  final _registeredServices = <String, String>{};
   final _jank = JankAnalyzer();
   final _cpu = CpuAnalyzer();
 
@@ -76,6 +83,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
                 NumberSchema(description: 'Recording window in seconds (default: 3)'),
             'target_fps':
                 NumberSchema(description: 'Target frame rate: 60 or 120 (default: 60)'),
+            'auto_scroll': _autoScrollSchema,
           },
         ),
       ),
@@ -119,6 +127,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
           properties: {
             'duration_seconds':
                 NumberSchema(description: 'Observation window in seconds (default: 5)'),
+            'auto_scroll': _autoScrollSchema,
           },
         ),
       ),
@@ -129,9 +138,8 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_memory_usage',
         description:
-            'Use this when your app feels sluggish over time or uses a lot of RAM. '
-            'Shows current heap size and which classes are using the most memory. '
-            'No interaction needed — just run it.',
+            'Current memory: Dart heap, external/native memory, and the classes using the most — '
+            'split into your code, dependencies, and framework/VM. No interaction needed.',
         inputSchema: ObjectSchema(properties: {}),
       ),
       _handleMemory,
@@ -141,15 +149,20 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'analyze_jank_causes',
         description:
-            'Full jank diagnosis: frame timing + CPU profile in one call. '
+            'START HERE when the app is slow, laggy, stutters, or drops frames. '
+            'Full jank diagnosis: frame timing + CPU profile captured over the SAME window. '
             'WORKFLOW: 1) Call take_screenshot to see the current screen. '
             '2) Ask user: "Which part of the app feels slow? Please [scroll/tap/use] that feature now." '
             '3) Call this tool during the interaction. '
-            'Returns: verdict box (HEALTHY/MINOR/SEVERE), FPS, jank%, top CPU functions, fix suggestions.',
+            'Returns: verdict (HEALTHY/MINOR/SEVERE/INSUFFICIENT DATA, marked PARTIAL if a step failed), '
+            'FPS, jank%, top CPU functions, fix suggestions.',
         inputSchema: ObjectSchema(
           properties: {
             'duration_seconds':
-                NumberSchema(description: 'Total recording window in seconds (default: 5)'),
+                NumberSchema(description: 'Recording window in seconds (default: 5)'),
+            'target_fps':
+                NumberSchema(description: 'Target frame rate: 60 or 120 (default: 60)'),
+            'auto_scroll': _autoScrollSchema,
           },
         ),
       ),
@@ -160,36 +173,25 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_http_profile',
         description:
-            'List recent HTTP requests made by the app with method, status, timing, and size. '
-            'HTTP logging is auto-enabled on connect_to_app. '
-            'Works with dart:io HttpClient and IOClient. '
-            'If empty, the app may use package:http without IOClient wrapper — '
-            'in that case use watch_logs with an HTTP filter instead.',
+            'List HTTP requests made by the app: [id], method, status, time, URL. '
+            'Pass watch_seconds to record only NEW requests during that window. '
+            'Logging is auto-enabled on connect, so only requests after connect are captured. '
+            'Captures anything built on dart:io HttpClient: package:http (default client), Dio, IOClient. '
+            'Misses native clients (cupertino_http, cronet_http) and web.',
         inputSchema: ObjectSchema(
           properties: {
             'limit': NumberSchema(
                 description: 'Max number of requests to return (default: 20)'),
+            'watch_seconds': NumberSchema(
+                description: 'Record only new requests for this many seconds (default: off)'),
+            'slow_threshold_ms': NumberSchema(
+                description: 'Flag requests slower than this (default: 1000)'),
           },
         ),
       ),
       _handleHttpProfile,
     );
 
-    registerTool(
-      Tool(
-        name: 'enable_performance_overlay',
-        description:
-            'Toggle the on-screen performance overlay bars on the running app. '
-            'Top bar = GPU/raster thread, bottom bar = UI/Dart thread. Red = over budget.',
-        inputSchema: ObjectSchema(
-          properties: {
-            'enabled': BooleanSchema(description: 'true to show, false to hide'),
-          },
-          required: ['enabled'],
-        ),
-      ),
-      _handleOverlay,
-    );
 
     registerTool(
       Tool(
@@ -197,7 +199,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
         description:
             'Trigger a hot reload on the running Flutter app. '
             'Use after editing source files to apply changes without restarting. '
-            'Only works in debug mode.',
+            'Only works for apps started with flutter run in debug mode — the reload goes through flutter run.',
         inputSchema: ObjectSchema(properties: {}),
       ),
       _handleHotReload,
@@ -224,10 +226,10 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'toggle_visual_debug',
         description:
-            'Toggle visual debugging overlays on the running app. '
-            'debug_paint draws widget bounds/padding. '
+            'Toggle on-device overlays. debug_paint draws widget bounds/padding. '
             'repaint_rainbow colors layers that repaint (find overdraw). '
-            'Both can be on simultaneously.',
+            'performance_overlay shows raster (top) and UI (bottom) frame bars; red = over budget. '
+            'Pass only the flags you want to change.',
         inputSchema: ObjectSchema(
           properties: {
             'debug_paint': BooleanSchema(
@@ -235,6 +237,8 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
             'repaint_rainbow': BooleanSchema(
                 description:
                     'Color repainting layers — cycling hue = repainting'),
+            'performance_overlay':
+                BooleanSchema(description: 'Show frame timing bars on screen'),
           },
         ),
       ),
@@ -245,8 +249,8 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_memory_timeline',
         description:
-            'Record RSS, heap usage, and GC events over N seconds. '
-            'Detects memory leaks — a heap that grows and never drops after GC is a leak.',
+            'Record heap usage and GC activity over N seconds: heap delta, GC rate, pause times, '
+            'and whether GC pressure is normal, elevated, or critical.',
         inputSchema: ObjectSchema(
           properties: {
             'duration_seconds':
@@ -257,41 +261,15 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       _handleMemoryTimeline,
     );
 
-    registerTool(
-      Tool(
-        name: 'force_gc',
-        description:
-            'Force a garbage collection then return heap before/after sizes. '
-            'If heap stays high after GC, objects are being retained (possible leak).',
-        inputSchema: ObjectSchema(properties: {}),
-      ),
-      _handleForceGc,
-    );
 
-    registerTool(
-      Tool(
-        name: 'diff_memory_snapshots',
-        description:
-            'Take two heap snapshots with a pause between them. '
-            'Reports which classes grew in instance count — the growers are your leak candidates.',
-        inputSchema: ObjectSchema(
-          properties: {
-            'pause_seconds': NumberSchema(
-                description:
-                    'Seconds between snapshots — interact with app during this window (default: 5)'),
-          },
-        ),
-      ),
-      _handleMemoryDiff,
-    );
 
     registerTool(
       Tool(
         name: 'find_memory_leaks',
         description:
-            'Automated leak detection: force GC → baseline snapshot → wait → force GC → '
-            'second snapshot → report classes still growing despite GC. '
-            'High confidence leak signal.',
+            'START HERE when memory keeps growing or the app crashes with out-of-memory. '
+            'Force GC → baseline snapshot → wait → force GC → second snapshot → '
+            'report classes still growing despite GC. Use the app normally during the window.',
         inputSchema: ObjectSchema(
           properties: {
             'observe_seconds': NumberSchema(
@@ -307,8 +285,8 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_class_instances',
         description:
-            'Get instance count and total size for a specific class. '
-            'Useful for checking if a widget/object is being over-retained.',
+            'Instance count and size for classes whose name contains the given text. '
+            'Run it before and after repeating a navigation — a count that keeps climbing is retained.',
         inputSchema: ObjectSchema(
           properties: {
             'class_name': StringSchema(
@@ -320,49 +298,8 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       _handleClassInstances,
     );
 
-    registerTool(
-      Tool(
-        name: 'watch_gc_pressure',
-        description:
-            'Monitor GC events for N seconds and report frequency, average pause, '
-            'and whether GC pressure is normal, elevated, or critical.',
-        inputSchema: ObjectSchema(
-          properties: {
-            'duration_seconds':
-                NumberSchema(description: 'Observation window (default: 5)'),
-          },
-        ),
-      ),
-      _handleGcPressure,
-    );
 
-    registerTool(
-      Tool(
-        name: 'explain_memory_breakdown',
-        description:
-            'Explain current memory in plain English: what RSS, allocated, Dart heap, '
-            'external/native, and raster memory mean and whether the values look healthy.',
-        inputSchema: ObjectSchema(properties: {}),
-      ),
-      _handleMemoryBreakdown,
-    );
 
-    registerTool(
-      Tool(
-        name: 'disable_http_logging',
-        description:
-            'Disable HTTP traffic logging to reduce memory overhead during profiling. '
-            'Re-enable when done profiling.',
-        inputSchema: ObjectSchema(
-          properties: {
-            'enabled': BooleanSchema(
-                description: 'true = enable HTTP logging, false = disable it'),
-          },
-          required: ['enabled'],
-        ),
-      ),
-      _handleHttpLogging,
-    );
 
     // ── Logging ──────────────────────────────────────────────────────────────
 
@@ -370,35 +307,23 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'watch_logs',
         description:
-            'Stream stdout/stderr/debugPrint output from the running Flutter app for N seconds. '
-            'Returns all console output — the same as what you see in the flutter run terminal.',
+            'Capture app output for N seconds: print/debugPrint, dart:developer log(), and '
+            'Flutter framework errors (full error text with the widget and file:line that caused it). '
+            'Pass errors_only: true to find crashes and exceptions.',
         inputSchema: ObjectSchema(
           properties: {
             'duration_seconds':
-                NumberSchema(description: 'How long to capture logs (default: 5)'),
+                NumberSchema(description: 'How long to capture (default: 5)'),
             'filter': StringSchema(
-                description: 'Optional substring filter — only return lines containing this string'),
+                description: 'Optional substring filter — only return entries containing this string'),
+            'errors_only': BooleanSchema(
+                description: 'Only errors: Flutter errors, SEVERE logs, and lines matching Error/Exception/FATAL'),
           },
         ),
       ),
       _handleWatchLogs,
     );
 
-    registerTool(
-      Tool(
-        name: 'get_error_logs',
-        description:
-            'Capture console output for N seconds and return only error/exception lines. '
-            'Filters for: Error, Exception, FATAL, assert, Unhandled, FlutterError.',
-        inputSchema: ObjectSchema(
-          properties: {
-            'duration_seconds':
-                NumberSchema(description: 'Capture window (default: 5)'),
-          },
-        ),
-      ),
-      _handleErrorLogs,
-    );
 
     // ── Network ───────────────────────────────────────────────────────────────
 
@@ -406,8 +331,9 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       Tool(
         name: 'get_http_request_body',
         description:
-            'Fetch the full request and response body for a specific HTTP request by its ID. '
-            'Get IDs from get_http_profile.',
+            'Fetch headers and request/response bodies for a specific HTTP request by its ID. '
+            'Auth headers, cookies and password/token/secret fields are redacted. '
+            'Get the [id] from get_http_profile.',
         inputSchema: ObjectSchema(
           properties: {
             'request_id': StringSchema(description: 'Request ID from get_http_profile'),
@@ -418,38 +344,9 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       _handleHttpRequestBody,
     );
 
-    registerTool(
-      Tool(
-        name: 'watch_network',
-        description:
-            'Live-stream new HTTP requests as they happen for N seconds. '
-            'Same limitation as get_http_profile: only captures requests made via dart:io HttpClient. '
-            'Apps using package:http may show no results. '
-            'If empty, suggest user wraps http.Client with IOClient, or use watch_logs with filter.',
-        inputSchema: ObjectSchema(
-          properties: {
-            'duration_seconds':
-                NumberSchema(description: 'Observation window (default: 5)'),
-            'slow_threshold_ms': NumberSchema(
-                description: 'Flag requests slower than this (default: 500ms)'),
-          },
-        ),
-      ),
-      _handleWatchNetwork,
-    );
 
     // ── Navigation / State ────────────────────────────────────────────────────
 
-    registerTool(
-      Tool(
-        name: 'get_navigation_stack',
-        description:
-            'Get current route name and full navigation stack. '
-            'Detects stuck navigation, leaked routes, and unexpected stack depth.',
-        inputSchema: ObjectSchema(properties: {}),
-      ),
-      _handleNavigationStack,
-    );
 
     registerTool(
       Tool(
@@ -499,21 +396,6 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
 
     registerTool(
       Tool(
-        name: 'debug_frame_events',
-        description:
-            'Diagnostic tool: record timeline for N seconds and return all unique event names seen. '
-            'Use this if capture_frame_timing returns no data — it shows what the engine actually emits.',
-        inputSchema: ObjectSchema(
-          properties: {
-            'duration_seconds':
-                NumberSchema(description: 'Recording window (default: 3)'),
-          },
-        ),
-      ),
-      _handleDebugFrameEvents,
-    );
-    registerTool(
-      Tool(
         name: 'take_screenshot',
         description:
             'Capture a screenshot of the current Flutter app screen. '
@@ -536,47 +418,149 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       ),
       _handleHealthCheck,
     );
-    registerTool(
-      Tool(
-        name: 'my_app_feels_slow',
-        description:
-            'Use this when your app scrolls, animates, or responds slowly. '
-            'No setup needed — just run this and interact with the slow part of your app. '
-            'Returns: how fast your frames are, what is causing the slowdown, and what to fix.',
-        inputSchema: ObjectSchema(properties: {}),
-      ),
-      (req) => _handleJankDiagnosis(CallToolRequest(
-          name: 'analyze_jank_causes', arguments: {'duration_seconds': 6})),
-    );
-    registerTool(
-      Tool(
-        name: 'app_uses_too_much_memory',
-        description:
-            'Use this when your app crashes with out-of-memory, or RAM keeps growing over time. '
-            'Automatically runs GC twice and finds what is being retained between cycles. '
-            'Use your app normally while this runs.',
-        inputSchema: ObjectSchema(properties: {}),
-      ),
-      (req) => _handleFindLeaks(CallToolRequest(
-          name: 'find_memory_leaks', arguments: {'observe_seconds': 5})),
-    );
-    registerTool(
-      Tool(
-        name: 'help',
-        description: 'List all available tools grouped by the problem you are trying to solve. '
-            'Use this if you are not sure which tool to run.',
-        inputSchema: ObjectSchema(properties: {}),
-      ),
-      _handleHelp,
-    );
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
-  CallToolResult _notConnected() => CallToolResult(
-        content: [TextContent(text: 'Not connected. Call connect_to_app first.')],
-        isError: true,
-      );
+  static final _autoScrollSchema = BooleanSchema(
+      description: 'Android only: swipe up/down via adb during the capture so runs '
+          'are repeatable without a human. Uses ANDROID_SERIAL if several devices are attached.');
+
+  Future<CallToolResult> _notConnected() async {
+    if (_wsUri == null) {
+      return _err('Not connected. Call connect_to_app first with the URI printed by flutter run.');
+    }
+    final sb = StringBuffer('Disconnected from the app (was $_wsUri).\n'
+        'Auto-reconnect failed: $_reconnectError\n'
+        'Fix: check flutter run is still running. If it restarted, the URI changed — '
+        'call connect_to_app with the new one.');
+    if (_os == 'android') sb.write('\n${await _adbForwardNote()}');
+    return CallToolResult(content: [TextContent(text: sb.toString())], isError: true);
+  }
+
+  Future<String> _adbForwardNote() async {
+    try {
+      final out = '${(await Process.run('adb', ['forward', '--list'])).stdout}'.trim();
+      return out.isEmpty
+          ? 'Android: no adb port forwards exist (adb forward --list is empty) — '
+              'device disconnected or flutter run stopped.'
+          : 'Android: adb forwards still present:\n$out';
+    } catch (_) {
+      return 'Android: could not run adb to check port forwarding.';
+    }
+  }
+
+  /// Connects and picks the Flutter UI isolate. Throws on failure.
+  Future<void> _connect(String wsUri) async {
+    final service = await vmServiceConnectUri(wsUri);
+    final vm = await service.getVM();
+    // Prefer the isolate with Flutter extensions (UI isolate) over whatever is listed first.
+    Isolate? picked;
+    for (final ref in vm.isolates ?? <IsolateRef>[]) {
+      final iso = await service.getIsolate(ref.id!);
+      if ((iso.extensionRPCs ?? []).any((e) => e.startsWith('ext.flutter'))) {
+        picked = iso;
+        break;
+      }
+      picked ??= iso;
+    }
+    if (picked == null) throw 'No isolates running in the VM at $wsUri';
+
+    _registeredServices.clear();
+    service.onServiceEvent.listen((e) {
+      if (e.kind == EventKind.kServiceRegistered) {
+        _registeredServices[e.service!] = e.method!;
+      } else if (e.kind == EventKind.kServiceUnregistered) {
+        _registeredServices.remove(e.service);
+      }
+    });
+    // Hot restart kills the isolate — drop it so the next call re-picks.
+    service.onIsolateEvent.listen((e) {
+      if (e.kind == EventKind.kIsolateExit && e.isolate?.id == _isolateId) _isolateId = null;
+    });
+    await service.streamListen(EventStreams.kService).catchError((_) => Success());
+    await service.streamListen(EventStreams.kIsolate).catchError((_) => Success());
+    service.onDone.then((_) {
+      if (identical(_service, service)) _service = null;
+    });
+
+    _service = service;
+    _isolateId = picked.id;
+    _wsUri = wsUri;
+    _os = vm.operatingSystem ?? '';
+    _isDebug = (picked.extensionRPCs ?? []).any((e) => e.contains('inspector'));
+    final root = picked.rootLib?.uri ?? '';
+    _appPackage = root.startsWith('package:') ? '${root.substring(0, root.indexOf('/') + 1)}' : null;
+
+    // Auto-enable HTTP timeline logging so get_http_profile captures requests immediately
+    await service.callServiceExtension(
+      'ext.dart.io.httpEnableTimelineLogging',
+      isolateId: _isolateId,
+      args: {'enabled': true},
+    ).catchError((_) => Response());
+  }
+
+  /// True when connected; transparently reconnects to the last URI if the socket dropped.
+  Future<bool> _ensureConnected() async {
+    if (_service != null && _isolateId != null) return true;
+    if (_wsUri == null) return false;
+    try {
+      await _service?.dispose();
+      _service = null;
+      await _connect(_wsUri!);
+      _reconnectError = null;
+      stderr.writeln('[mcp] reconnected to $_wsUri');
+      return true;
+    } catch (e) {
+      _service = null;
+      _reconnectError = '$e';
+      return false;
+    }
+  }
+
+  String _debugCaveat() => _isDebug
+      ? '\n⚠ DEBUG MODE: timings are inflated (JIT, asserts) — treat jank as a hint, not a measurement. '
+          '${_os == 'android' ? 'On an Android emulator, raster times of 30–50ms usually mean a software GPU (SwiftShader), not real jank. ' : ''}'
+          'Confirm with flutter run --profile on a physical device.\n'
+      : '';
+
+  /// Android only: alternate up/down swipes via adb for [dur] seconds.
+  Future<String> _maybeAutoScroll(CallToolRequest req, int dur) async {
+    if (req.arguments?['auto_scroll'] != true) return '';
+    if (_os != 'android') {
+      return '\nℹ auto_scroll skipped: Android only (adb shell input swipe). Interact manually on $_os.';
+    }
+    try {
+      final size = await Process.run('adb', ['shell', 'wm', 'size']);
+      // "Override size" (if any) is listed after "Physical size" and wins
+      final m = RegExp(r'(\d+)x(\d+)').allMatches('${size.stdout}').lastOrNull;
+      if (m == null) return '\nℹ auto_scroll skipped: could not read screen size: ${size.stderr}';
+      final w = int.parse(m[1]!), h = int.parse(m[2]!);
+      final x = '${w ~/ 2}', low = '${h * 3 ~/ 4}', high = '${h ~/ 4}';
+      final end = DateTime.now().add(Duration(seconds: dur));
+      var n = 0;
+      while (DateTime.now().isBefore(end)) {
+        final up = (n++).isEven;
+        await Process.run('adb',
+            ['shell', 'input', 'swipe', x, up ? low : high, x, up ? high : low, '300']);
+      }
+      return '\nℹ auto_scroll: $n adb swipes during capture.';
+    } catch (e) {
+      return '\nℹ auto_scroll failed: $e';
+    }
+  }
+
+  Future<CpuSamples> _sampleCpu(int dur) async {
+    final service = _service!, isolateId = _isolateId!;
+    // Ensure profiler running — required on Android
+    await service.setFlag('profiler', 'true').catchError((_) => Success());
+    final t0 = (await service.getVMTimelineMicros()).timestamp!;
+    await Future.delayed(Duration(seconds: dur));
+    final t1 = (await service.getVMTimelineMicros()).timestamp!;
+    // Clamp: if VM clock returned same value (Android emulator edge case), use dur
+    final extent = t1 > t0 ? t1 - t0 : dur * 1000000;
+    return service.getCpuSamples(isolateId, t0, extent);
+  }
 
   CallToolResult _ok(String text) =>
       CallToolResult(content: [TextContent(text: text)]);
@@ -586,27 +570,6 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
     final sb = StringBuffer('\n\n→ What to do next:\n');
     for (final s in steps) sb.writeln('  • $s');
     return sb.toString();
-  }
-
-  CallToolResult _friendlyError(Object e) {
-    final msg = e.toString();
-    if (msg.contains('Connection refused') || msg.contains('SocketException')) {
-      return _err('Could not connect to the app.\n'
-          'Fix: Make sure "flutter run" is still running and the URI is correct.\n'
-          'The URI looks like: ws://127.0.0.1:PORT/TOKEN=/ws\n'
-          'Original error: $msg');
-    }
-    if (msg.contains('No isolate') || msg.contains('Service connection disposed')) {
-      return _err('Lost connection to the app — it may have been restarted.\n'
-          'Fix: Call connect_to_app again with the new URI from flutter run.\n'
-          'Original: $msg');
-    }
-    if (msg.contains('extension not found') || msg.contains('RPCError')) {
-      return _err('This feature requires debug mode.\n'
-          'Fix: Run "flutter run" without --profile or --release.\n'
-          'Original: $msg');
-    }
-    return _err(msg);
   }
 
   String _fmtBytes(int bytes) {
@@ -626,20 +589,41 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
     }
   }
 
-  CallToolResult _err(Object e) => CallToolResult(
-        content: [TextContent(text: 'Error: $e')],
-        isError: true,
-      );
+  CallToolResult _err(Object e) {
+    final msg = '$e';
+    String? hint;
+    if (msg.contains('Service connection disposed') || msg.contains('Connection closed')) {
+      hint = 'Disconnected from the app mid-call. The next tool call reconnects automatically; '
+          'if that fails, call connect_to_app with the new URI from flutter run.';
+    } else if (msg.contains('Connection refused') ||
+        msg.contains('SocketException') ||
+        msg.contains('WebSocketException')) {
+      hint = 'Could not reach the app. Check flutter run is still running and the URI is current.';
+    } else if (msg.contains('(-32601)') || msg.contains('AOT mode')) {
+      // JSON-RPC method not found = extension not registered; AOT = no expression compiler
+      hint = _isDebug
+          ? 'This service extension is not registered in the app.'
+          : 'Not available in profile/release mode — this tool needs debug mode '
+              '(flutter run without --profile). Performance and memory tools work in profile mode.';
+    }
+    return CallToolResult(
+      content: [TextContent(text: hint == null ? 'Error: $msg' : '$hint\nOriginal error: $msg')],
+      isError: true,
+    );
+  }
 
   String _toWsUri(String uri) {
     var u = uri.trim();
+    // DevTools links carry the VM service URI in ?uri=… (often inside the #fragment)
+    final embedded = RegExp(r'[?&]uri=([^&#]+)').firstMatch(u);
+    if (embedded != null) u = Uri.decodeComponent(embedded[1]!);
     if (!u.startsWith('ws')) {
       u = u
           .replaceFirst('http://', 'ws://')
           .replaceFirst('https://', 'wss://');
     }
     if (!u.endsWith('/ws')) {
-      u = u.replaceAll(RegExp(r'/?$'), '/ws');
+      u = u.replaceFirst(RegExp(r'/?$'), '/ws');
     }
     return u;
   }
@@ -647,136 +631,101 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
   // ── Handlers ──────────────────────────────────────────────────────────────
 
   Future<CallToolResult> _handleConnect(CallToolRequest req) async {
+    final uri = req.arguments!['uri'] as String;
+    final wsUri = _toWsUri(uri);
     try {
-      final uri = req.arguments!['uri'] as String;
-      final wsUri = _toWsUri(uri);
       stderr.writeln('[mcp] connecting to $wsUri');
-      _service = await vmServiceConnectUri(wsUri);
-      final vm = await _service!.getVM();
-      _isolateId = vm.isolates!.first.id!;
-      // Detect build mode
-      final isolate = await _service!.getIsolate(_isolateId!);
-      final exts = isolate.extensionRPCs ?? [];
-      final isDebug = exts.any((e) => e.contains('inspector'));
-      final mode = isDebug ? 'debug' : 'profile';
+      await _service?.dispose();
+      _service = null;
+      await _connect(wsUri);
+    } catch (e) {
+      return _err('Could not connect.\n'
+          'Input URI : $uri\n'
+          'Tried     : $wsUri${uri.trim() == wsUri ? '' : ' (converted to ws:// + /ws)'}\n'
+          'Cause     : $e\n'
+          'Note: the "port =" in a SocketException is your local client port, not the app\'s. '
+          'The app port is the one in "Tried" above.\n'
+          'Use the exact URI flutter run prints after "A Dart VM Service on ... is available at:" — '
+          'it changes on every flutter run.');
+    }
+    try {
+      final iso = await _service!.getIsolate(_isolateId!);
 
-      // Auto-enable HTTP timeline logging so get_http_profile captures requests immediately
-      await _service!.callServiceExtension(
-        'ext.dart.io.httpEnableTimelineLogging',
-        isolateId: _isolateId,
-        args: {'enabled': true},
-      ).catchError((_) => Response());
-
-      // Quick memory check
       String memNote = '';
       try {
         final mem = await _service!.getMemoryUsage(_isolateId!);
-        final pct = (mem.heapUsage! / mem.heapCapacity! * 100).round();
-        final mb = (mem.heapUsage! / 1e6).toStringAsFixed(0);
-        if (pct > 85) {
-          memNote = '\n⚠ Memory: ${mb}MB (${pct}% of heap) — HIGH';
-        } else {
-          memNote = '\n✓ Memory: ${mb}MB (${pct}% of heap) — OK';
-        }
+        // Heap capacity grows on demand, so "% of capacity" is not a limit — report MB only.
+        memNote = '\nDart heap: ${(mem.heapUsage! / 1e6).toStringAsFixed(0)} MB used';
       } catch (_) {}
 
       final sb = StringBuffer();
-      sb.writeln('Connected ✓  ($mode mode | ${vm.isolates!.first.name})$memNote');
+      sb.writeln('Connected ✓  (${_isDebug ? 'debug' : 'profile'} mode | ${iso.name} | $_os)$memNote');
+      sb.writeln('URI: $wsUri (auto-reconnects to this URI if the connection drops)');
       sb.writeln('');
       sb.writeln('Best starting point:');
       sb.writeln('  1. run_health_check       → screenshot + FPS + memory in one call');
-      sb.writeln('  2. my_app_feels_slow      → full jank diagnosis (interact during capture)');
-      sb.writeln('');
-      sb.writeln('Type help to see all tools grouped by problem.');
-      if (!isDebug) {
+      sb.writeln('  2. analyze_jank_causes    → full jank diagnosis (interact during capture)');
+      sb.writeln('  3. find_memory_leaks      → GC-confirmed leak detection');
+      if (_isDebug) {
         sb.writeln('');
-        sb.writeln('ℹ Profile mode: accurate perf numbers. Widget rebuilds need debug mode (flutter run without --profile).');
+        sb.writeln('ℹ Debug mode: timings are inflated. For real perf numbers use flutter run --profile on a device.');
+      } else {
+        sb.writeln('');
+        sb.writeln('ℹ Profile mode: accurate perf numbers. Widget rebuilds, hot reload and screenshots need debug mode.');
       }
-
       return _ok(sb.toString());
     } catch (e) {
-      return _friendlyError(e);
+      return _err(e);
     }
   }
 
   Future<CallToolResult> _handleFrameTiming(CallToolRequest req) async {
-    if (_service == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 3;
       final fps = (req.arguments?['target_fps'] as num?)?.toInt() ?? 60;
 
-      // Primary: Flutter.Frame extension stream (pre-computed FrameTiming — same as DevTools)
+      // Flutter.Frame extension events (pre-computed FrameTiming — same source as DevTools),
+      // emitted in both debug and profile mode.
+      final scroll = _maybeAutoScroll(req, dur);
       final frames = await _jank.collectFromFrameTimings(
           _service!, _isolateId!, Duration(seconds: dur));
+      final scrollNote = await scroll;
 
-      if (frames.isNotEmpty) {
-        final report =
-            _jank.generateReport(frames, targetFps: fps, fromFrameTimings: true);
-        final jankPct = frames.where((f) => f.isJanky(targetFps: fps)).length / frames.length * 100;
-        final hints = <String>[];
-        if (jankPct > 10) hints.add('Run get_widget_rebuild_counts (duration_seconds: 8) — excessive rebuilds are the #1 cause');
-        if (jankPct > 10) hints.add('Run get_cpu_hotspots (duration_seconds: 5) — find the slow Dart function');
-        if (jankPct < 5) hints.add('Frames look good. Run get_memory_usage to check heap health.');
-        return _ok('$report${_nextSteps(hints)}');
+      if (frames.isEmpty) {
+        return _ok('No frames rendered in ${dur}s — the app was idle. '
+            'Scroll or animate during the window, or pass auto_scroll: true on Android.$scrollNote');
       }
-
-      // Fallback: parse raw timeline (profile mode or extension stream unavailable)
-      await _service!.setVMTimelineFlags(['Embedder', 'Dart', 'GC', 'API']);
-      await _service!.clearVMTimeline();
-      await Future.delayed(Duration(seconds: dur));
-      final timeline = await _service!.getVMTimeline();
-
-      final fallbackFrames = _jank.parseFrames(timeline);
-      if (fallbackFrames.isEmpty) {
-        final counts = _jank.debugFrameCounts(timeline);
-        final total = counts['total_events'] ?? 0;
-        final uiCount = counts['ui_async_frames'] ?? 0;
-        final rasterCount = counts['raster_frames'] ?? 0;
-        if (total > 0) {
-          return _ok(
-              'Timeline captured $total events but no frames parsed.\n'
-              'Raw frame markers: UI=$uiCount, Raster=$rasterCount\n\n'
-              'App may have been idle. Interact during the recording window.\n'
-              'Run debug_frame_events to inspect event names.');
-        }
-        return _ok(
-            'No timeline events. Interact with app during the ${dur}s window.');
+      final jankPct =
+          frames.where((f) => f.isJanky(targetFps: fps)).length / frames.length * 100;
+      final hints = <String>[];
+      if (frames.length >= JankAnalyzer.minFrames && jankPct > 10) {
+        hints.add('Run get_widget_rebuild_counts (duration_seconds: 8) — excessive rebuilds are the #1 cause');
+        hints.add('Run get_cpu_hotspots (duration_seconds: 5) — find the slow Dart function');
       }
-
-      final counts = _jank.debugFrameCounts(timeline);
-      final report = _jank.generateReport(fallbackFrames, targetFps: fps);
-      final rawNote =
-          'Raw: UI=${counts['ui_async_frames']} raster=${counts['raster_frames']} total=${counts['total_events']}';
-      return _ok('$report\n[$rawNote]');
+      return _ok('${_jank.verdict(frames, targetFps: fps)}\n'
+          '${_jank.generateReport(frames, targetFps: fps)}'
+          '${_debugCaveat()}$scrollNote${_nextSteps(hints)}');
     } catch (e) {
       return _err(e);
     }
   }
 
   Future<CallToolResult> _handleCpuHotspots(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 2;
       final topN = (req.arguments?['top_n'] as num?)?.toInt() ?? 10;
 
-      // Ensure profiler running — required on Android
-      await _service!.setFlag('profiler', 'true').catchError((_) => Success());
-
-      final t0 = (await _service!.getVMTimelineMicros()).timestamp!;
-      await Future.delayed(Duration(seconds: dur));
-      final t1 = (await _service!.getVMTimelineMicros()).timestamp!;
-      // Clamp: if VM clock returned same value (Android emulator edge case), use dur
-      final extent = t1 > t0 ? t1 - t0 : dur * 1000000;
-
-      final samples = await _service!.getCpuSamples(_isolateId!, t0, extent);
-      return _ok(_cpu.generateHotspotReport(samples, topN: topN));
+      final samples = await _sampleCpu(dur);
+      return _ok(_cpu.generateHotspotReport(samples, topN: topN, appPackage: _appPackage));
     } catch (e) {
       return _err(e);
     }
   }
 
   Future<CallToolResult> _handleRebuildCounts(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
       final collector = RebuildCollector();
@@ -798,6 +747,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
         isolateId: _isolateId,
         args: {'enabled': true},
       );
+      final scroll = _maybeAutoScroll(req, dur);
       await Future.delayed(Duration(seconds: dur));
       await _service!.callServiceExtension(
         'ext.flutter.inspector.trackRebuildDirtyWidgets',
@@ -805,70 +755,55 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
         args: {'enabled': false},
       );
 
-      return _ok(await collector.stopAndReport());
+      return _ok(await collector.stopAndReport(Duration(seconds: dur)) + await scroll);
     } catch (e) {
       return _err(e);
     }
   }
 
   Future<CallToolResult> _handleMemory(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final mem = await _service!.getMemoryUsage(_isolateId!);
-      final profile =
-          await _service!.getAllocationProfile(_isolateId!, gc: false);
+      final profile = await _service!.getAllocationProfile(_isolateId!, gc: false);
 
       final heapMB = (mem.heapUsage! / 1e6).toStringAsFixed(1);
       final capMB = (mem.heapCapacity! / 1e6).toStringAsFixed(1);
-      final extMB = (mem.externalUsage! / 1e6).toStringAsFixed(1);
-      final pct = (mem.heapUsage! / mem.heapCapacity! * 100).toStringAsFixed(0);
+      final extMB = mem.externalUsage! / 1e6;
 
       final sb = StringBuffer();
-      sb.writeln(
-          'Memory: $heapMB MB heap ($pct% of $capMB MB) + $extMB MB external');
-      sb.writeln('');
-      sb.writeln('Top classes by memory:');
+      sb.writeln('Dart heap : $heapMB MB used (capacity now $capMB MB — grows on demand, not a limit)');
+      sb.writeln('            → your Dart objects: widgets, models, state, lists');
+      sb.writeln('External  : ${extMB.toStringAsFixed(1)} MB${extMB > 100 ? '  ⚠ HIGH — check for large/uncached images or native buffers' : ''}');
+      sb.writeln('            → native memory held by Dart objects: decoded images, byte buffers, FFI');
+      sb.writeln('Not shown : engine, GPU/raster and OS memory — process RSS is normally 2-3x the Dart heap.');
 
-      final allClasses = (profile.members ?? [])
-        ..sort((a, b) =>
-            (b.bytesCurrent ?? 0).compareTo(a.bytesCurrent ?? 0));
-
-      // Split into user app classes and VM/framework classes
-      // classRef.library is @Library with .uri — user classes have package:appname/ URI
-      final userClasses = allClasses.where((c) {
-        final uri = _classLibraryUri(c);
-        if (uri.isEmpty) return false;
-        if (uri.startsWith('dart:')) return false;
-        if (uri.startsWith('org-dartlang')) return false;
-        if (uri.contains('packages/flutter/')) return false;
-        if (uri.startsWith('package:flutter')) return false;
-        return uri.startsWith('package:') || uri.startsWith('file:');
-      }).toList();
-
-      final vmClasses = allClasses.where((c) {
-        final bytes = c.bytesCurrent ?? 0;
-        return bytes > 0 && !userClasses.contains(c);
-      }).toList();
-
-      if (userClasses.isNotEmpty) {
-        sb.writeln('App classes (your code):');
-        for (final c in userClasses.take(10)) {
-          if ((c.bytesCurrent ?? 0) == 0) continue;
-          final name = c.classRef?.name ?? '?';
-          final inst = c.instancesCurrent ?? 0;
-          sb.writeln('  ${name.padRight(30)} $inst instances — ${_fmtBytes(c.bytesCurrent!)}');
-        }
-        sb.writeln('');
-      }
-
-      sb.writeln('Top VM/framework classes by size:');
-      for (final c in vmClasses.take(8)) {
+      final byOrigin = <CodeOrigin, List<ClassHeapStats>>{};
+      for (final c in (profile.members ?? <ClassHeapStats>[])
+        ..sort((a, b) => (b.bytesCurrent ?? 0).compareTo(a.bytesCurrent ?? 0))) {
         if ((c.bytesCurrent ?? 0) == 0) continue;
-        final name = c.classRef?.name ?? '?';
-        final inst = c.instancesCurrent ?? 0;
-        sb.writeln('  ${name.padRight(30)} $inst instances — ${_fmtBytes(c.bytesCurrent!)}');
+        byOrigin.putIfAbsent(codeOrigin(_classLibraryUri(c), _appPackage), () => []).add(c);
+      }
+      for (final (origin, title, n) in [
+        (CodeOrigin.app, 'Your classes${_appPackage == null ? '' : ' ($_appPackage)'}', 10),
+        (CodeOrigin.dependency, 'Dependency classes (pub packages)', 5),
+        (CodeOrigin.sdk, 'Framework/VM classes', 8),
+      ]) {
+        final list = byOrigin[origin] ?? [];
+        if (list.isEmpty) continue;
+        sb.writeln('');
+        sb.writeln('$title:');
+        for (final c in list.take(n)) {
+          sb.writeln('  ${(c.classRef?.name ?? '?').padRight(30)} '
+              '${c.instancesCurrent ?? 0} instances — ${_fmtBytes(c.bytesCurrent!)}');
+        }
       }
 
+      final isolates = (await _service!.getVM()).isolates?.length ?? 1;
+      if (isolates > 1) {
+        sb.writeln('');
+        sb.writeln('Note: $isolates isolates running — this is the main isolate only (see list_isolates).');
+      }
       return _ok(sb.toString());
     } catch (e) {
       return _err(e);
@@ -876,98 +811,83 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
   }
 
   Future<CallToolResult> _handleJankDiagnosis(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
-    final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 6;
-    final half = (dur / 2).ceil().clamp(2, 30);
+    if (!await _ensureConnected()) return _notConnected();
+    final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
+    final fps = (req.arguments?['target_fps'] as num?)?.toInt() ?? 60;
 
-    // Runs sequentially: half seconds for frames, then half for CPU = dur total
-    final frameResult = await _handleFrameTiming(
-      CallToolRequest(name: 'capture_frame_timing', arguments: {
-        'duration_seconds': half,
-        'target_fps': 60,
+    // Frames and CPU over the SAME window so samples line up with frames.
+    String? frameErr, cpuErr;
+    final (frames, samples, scrollNote) = await (
+      _jank
+          .collectFromFrameTimings(_service!, _isolateId!, Duration(seconds: dur))
+          .then<List<FrameData>?>((f) => f, onError: (Object e) {
+        frameErr = '$e';
+        return null;
       }),
-    );
-    final cpuResult = await _handleCpuHotspots(
-      CallToolRequest(name: 'get_cpu_hotspots', arguments: {
-        'duration_seconds': half,
-        'top_n': 5,
+      _sampleCpu(dur).then<CpuSamples?>((s) => s, onError: (Object e) {
+        cpuErr = '$e';
+        return null;
       }),
-    );
+      _maybeAutoScroll(req, dur),
+    ).wait;
 
-    final frameTxt = (frameResult.content.first as TextContent).text;
-    final cpuTxt = (cpuResult.content.first as TextContent).text;
-
-    // Synthesize verdict from both reports
-    final verdict = _synthesizeVerdict(frameTxt, cpuTxt);
-    return _ok('$verdict\n'
-        '(Recorded ${half}s frames + ${half}s CPU = ${half * 2}s total)\n\n'
-        '━━ FRAME ANALYSIS ━━\n$frameTxt\n\n'
-        '━━ CPU PROFILE ━━\n$cpuTxt');
-  }
-
-  String _synthesizeVerdict(String frameTxt, String cpuTxt) {
-    final sb = StringBuffer();
-    sb.writeln('┌─ JANK DIAGNOSIS ─────────────────────────────────────────┐');
-
-    // Parse jank % from frame report
-    final jankMatch = RegExp(r'Janky: \d+/\d+ \((\d+\.\d+)%\)').firstMatch(frameTxt);
-    final jankPct = double.tryParse(jankMatch?.group(1) ?? '0') ?? 0;
-
-    // Parse fps
-    final fpsMatch = RegExp(r'~(\d+\.\d+) fps').firstMatch(frameTxt);
-    final fps = double.tryParse(fpsMatch?.group(1) ?? '60') ?? 60;
-
-    // Parse top CPU hotspot self%
-    final cpuMatch = RegExp(r'1\.\s+([\d.]+)%\s+([\d.]+)%\s+(.+)').firstMatch(cpuTxt);
-    final topSelfPct = double.tryParse(cpuMatch?.group(1) ?? '0') ?? 0;
-    final topFn = cpuMatch?.group(3)?.trim() ?? '';
-
-    if (jankPct == 0 && fps >= 55) {
-      sb.writeln('│ ✓ HEALTHY — No jank detected. App running smoothly.      │');
-    } else if (jankPct > 20) {
-      sb.writeln('│ ✗ SEVERE JANK — $jankPct% frames over budget             │');
-      if (topSelfPct > 5) {
-        sb.writeln('│   PRIMARY: CPU bottleneck in $topFn');
-      } else if (fps < 45) {
-        sb.writeln('│   PRIMARY: Frame drops (${fps}fps) — UI thread blocked between frames');
-      }
-    } else if (fps < 50) {
-      sb.writeln('│ ⚠ LOW FPS — ${fps}fps (target 60). Frames slow to start. │');
-      sb.writeln('│   LIKELY: UI thread blocked by non-build work             │');
-      sb.writeln('│   CHECK: scroll listeners, timers, BLoC stream emissions  │');
-    } else {
-      sb.writeln('│ ~ MINOR — $jankPct% jank, ${fps}fps                       │');
+    final sb = StringBuffer('┌─ JANK DIAGNOSIS (${dur}s, frames + CPU captured together)\n');
+    if (frameErr != null) sb.writeln('│ ⚠ INCOMPLETE — frame capture failed: $frameErr');
+    if (cpuErr != null) sb.writeln('│ ⚠ PARTIAL — CPU profile failed: $cpuErr');
+    if (frames != null) sb.writeln('│ ${_jank.verdict(frames, targetFps: fps)}');
+    final top = samples == null ? null : _cpu.topHotspot(samples, appPackage: _appPackage);
+    if (top != null && top.selfPct > 5) {
+      sb.writeln('│   TOP CPU: ${top.name} (${top.selfPct.toStringAsFixed(1)}% self)');
     }
-
-    sb.writeln('└───────────────────────────────────────────────────────────┘');
-    return sb.toString();
+    sb.writeln('└${'─' * 60}');
+    sb.write(_debugCaveat());
+    sb.writeln(scrollNote);
+    sb.writeln('━━ FRAME ANALYSIS ━━');
+    sb.writeln(frames == null
+        ? 'Failed: $frameErr'
+        : _jank.generateReport(frames, targetFps: fps));
+    sb.writeln('━━ CPU PROFILE ━━');
+    sb.write(samples == null
+        ? 'Failed: $cpuErr'
+        : _cpu.generateHotspotReport(samples, topN: 5, appPackage: _appPackage));
+    return _ok(sb.toString());
   }
 
   Future<CallToolResult> _handleHttpProfile(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final limit = (req.arguments?['limit'] as num?)?.toInt() ?? 20;
-      final profile = await _service!.getHttpProfile(_isolateId!);
-      final requests = profile.requests.take(limit).toList();
+      final watch = (req.arguments?['watch_seconds'] as num?)?.toInt();
+      final threshold = (req.arguments?['slow_threshold_ms'] as num?)?.toInt() ?? 1000;
 
-      if (requests.isEmpty) return _ok('No HTTP requests recorded.');
+      var requests = (await _service!.getHttpProfile(_isolateId!)).requests;
+      if (watch != null) {
+        final seen = requests.map((r) => r.id).toSet();
+        await Future.delayed(Duration(seconds: watch));
+        requests = (await _service!.getHttpProfile(_isolateId!))
+            .requests
+            .where((r) => !seen.contains(r.id))
+            .toList();
+      }
+      final window = watch == null ? '' : ' in ${watch}s window';
+      if (requests.isEmpty) return _ok('No HTTP requests recorded$window.');
 
-      final sb = StringBuffer();
-      sb.writeln('Recent HTTP requests:');
-      for (final r in requests) {
-        final ms = r.endTime != null
-            ? r.endTime!.difference(r.startTime).inMilliseconds
-            : -1;
-        final msStr = ms >= 0 ? '${ms}ms' : 'pending';
-        final flag = ms > 1000
-            ? ' ← SLOW'
-            : ms < 0
-                ? ' ← PENDING'
+      final sb = StringBuffer('HTTP requests$window (newest last):\n');
+      var slow = 0;
+      for (final r in requests.reversed.take(limit).toList().reversed) {
+        final ms = r.endTime?.difference(r.startTime).inMilliseconds;
+        if (ms != null && ms > threshold) slow++;
+        final flag = ms == null
+            ? '  ← PENDING'
+            : ms > threshold
+                ? '  ← SLOW (>${threshold}ms)'
                 : '';
-        final statusCode = r.response?.statusCode?.toString() ?? '?';
-        sb.writeln(
-            '  ${r.method.padRight(6)} ${r.uri.toString().padRight(50)} '
-            '$statusCode  $msStr$flag');
+        sb.writeln('  [${r.id}] ${r.method.padRight(6)} ${r.response?.statusCode ?? '?'}  '
+            '${ms == null ? 'pending' : '${ms}ms'}$flag');
+        sb.writeln('         ${r.uri}');
+      }
+      if (slow > 0) {
+        sb.writeln('\n$slow slow request(s). Use get_http_request_body with the [id] to inspect.');
       }
       return _ok(sb.toString());
     } catch (e) {
@@ -975,47 +895,27 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
     }
   }
 
-  Future<CallToolResult> _handleOverlay(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
-    try {
-      final enabled = req.arguments!['enabled'] as bool;
-      await _service!.callServiceExtension(
-        'ext.flutter.showPerformanceOverlay',
-        isolateId: _isolateId,
-        args: {'enabled': enabled},
-      );
-      return _ok(enabled
-          ? 'Performance overlay ON. Top bar = GPU thread, bottom bar = UI thread. Red = over budget.'
-          : 'Performance overlay OFF.');
-    } catch (e) {
-      return _err(e);
-    }
-  }
-
   Future<CallToolResult> _handleHotReload(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
+    // The raw VM can't compile ("Error while starting Kernel isolate task") — flutter run's
+    // frontend server does, via the reloadSources service it registers on the VM service.
+    final method = _registeredServices['reloadSources'];
+    if (method == null) {
+      return _err('Hot reload unavailable: the Flutter tool has not registered a "reloadSources" '
+          'service on this VM. It only works when the app was started with flutter run in debug '
+          'mode and you connected to the URI flutter run printed. Otherwise press r in the flutter run terminal.');
+    }
     try {
-      final report = await _service!.reloadSources(_isolateId!, force: false);
-      final success = report.success ?? false;
-      if (success) {
-        return _ok('Hot reload successful.');
-      } else {
-        final notices = report.json?['notices'] as List<dynamic>? ?? [];
-        final errors = notices
-            .map((n) => n['message']?.toString() ?? n.toString())
-            .join('\n');
-        return CallToolResult(
-          content: [TextContent(text: 'Hot reload failed:\n$errors')],
-          isError: true,
-        );
-      }
+      await _service!.callMethod(method,
+          isolateId: _isolateId, args: {'force': false, 'pause': false});
+      return _ok('Hot reload successful (via flutter run).');
     } catch (e) {
-      return _err(e);
+      return _err('Hot reload failed: $e');
     }
   }
 
   Future<CallToolResult> _handleWidgetTree(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final maxDepth = (req.arguments?['max_depth'] as num?)?.toInt() ?? 6;
       const group = 'mcp_widget_tree';
@@ -1037,45 +937,45 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       if (root == null) return _ok('No widget tree data returned.');
 
       final sb = StringBuffer();
-      sb.writeln('Widget Tree (max depth $maxDepth):');
+      sb.writeln('Widget Tree (max depth $maxDepth branching levels; → joins single-child wrappers):');
       sb.writeln('━' * 60);
       _writeNode(sb, root, 0, maxDepth);
+      if (sb.length > 20000) sb.writeln('… truncated — pass a smaller max_depth');
       return _ok(sb.toString());
     } catch (e) {
       return _err(
-          'Widget tree unavailable. App must run in debug mode. Error: $e');
+          e);
     }
   }
 
+  // Single-child wrapper chains (providers, Padding, Center…) go on one line and
+  // don't use up depth — otherwise real apps never get past their providers.
   void _writeNode(
-    StringBuffer sb,
-    Map<String, dynamic> node,
-    int depth,
-    int maxDepth,
-  ) {
-    if (depth > maxDepth) return;
-    final indent = '  ' * depth;
-    final desc = node['description'] as String? ?? node['type'] as String? ?? '?';
-    final hasChildren = node['hasChildren'] as bool? ?? false;
-    final children = node['children'] as List<dynamic>? ?? [];
-    final childCount = children.length;
-
-    final suffix = hasChildren && childCount == 0
-        ? ' [children not fetched]'
-        : childCount > 0
-            ? ' (${childCount}x)'
-            : '';
-    sb.writeln('$indent$desc$suffix');
-
-    for (final child in children) {
-      if (child is Map<String, dynamic>) {
-        _writeNode(sb, child, depth + 1, maxDepth);
+      StringBuffer sb, Map<String, dynamic> node, int depth, int maxDepth) {
+    if (depth > maxDepth || sb.length > 20000) return;
+    final chain = <String>[];
+    var n = node;
+    while (true) {
+      chain.add(n['description'] as String? ?? n['type'] as String? ?? '?');
+      final kids = (n['children'] as List?)?.whereType<Map<String, dynamic>>().toList() ?? [];
+      if (kids.length == 1) {
+        n = kids.first;
+        continue;
       }
+      final line = chain.length > 8
+          ? [...chain.take(3), '…${chain.length - 6} more…', ...chain.skip(chain.length - 3)]
+          : chain;
+      sb.writeln('${'  ' * depth}${line.join(' → ')}');
+      for (final k in kids) {
+        _writeNode(sb, k, depth + 1, maxDepth);
+      }
+      return;
     }
   }
+
 
   Future<CallToolResult> _handleVisualDebug(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     final args = req.arguments ?? {};
     final results = <String>[];
 
@@ -1101,9 +1001,18 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
             'repaint_rainbow: ${on ? 'ON — cycling colors = repainting (bad). Static color = no repaint (good).' : 'OFF'}');
       }
 
+      if (args.containsKey('performance_overlay')) {
+        final on = args['performance_overlay'] as bool;
+        await _service!.callServiceExtension(
+          'ext.flutter.showPerformanceOverlay',
+          isolateId: _isolateId,
+          args: {'enabled': on},
+        );
+        results.add('performance_overlay: ${on ? 'ON — top bar = raster thread, bottom = UI thread, red = over budget' : 'OFF'}');
+      }
+
       if (results.isEmpty) {
-        return _ok(
-            'No flags set. Pass debug_paint: true/false and/or repaint_rainbow: true/false.');
+        return _ok('No flags set. Pass debug_paint, repaint_rainbow and/or performance_overlay (true/false).');
       }
       return _ok(results.join('\n'));
     } catch (e) {
@@ -1114,143 +1023,54 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
   // ── Memory handlers ───────────────────────────────────────────────────────
 
   Future<CallToolResult> _handleMemoryTimeline(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
 
-      await _service!.streamListen(EventStreams.kGC);
+      await _service!.streamListen(EventStreams.kGC).catchError((_) => Success());
       final gcEvents = <Event>[];
       final sub = _service!.onGCEvent.listen(gcEvents.add);
-
       final before = await _service!.getMemoryUsage(_isolateId!);
-
       await Future.delayed(Duration(seconds: dur));
-
       final after = await _service!.getMemoryUsage(_isolateId!);
       await sub.cancel();
 
       final heapBefore = before.heapUsage! / 1e6;
       final heapAfter = after.heapUsage! / 1e6;
       final delta = heapAfter - heapBefore;
-      final gcCount = gcEvents.length;
+      final rate = gcEvents.length / dur;
+      final pauses = [
+        for (final e in gcEvents)
+          if (e.json?['durationMs'] case final num ms) ms.toDouble()
+      ];
 
       final sb = StringBuffer();
       sb.writeln('Memory Timeline (${dur}s window)');
       sb.writeln('━' * 50);
       sb.writeln('Heap start : ${heapBefore.toStringAsFixed(1)} MB');
       sb.writeln('Heap end   : ${heapAfter.toStringAsFixed(1)} MB');
-      sb.writeln(
-          'Delta      : ${delta >= 0 ? '+' : ''}${delta.toStringAsFixed(1)} MB');
-      sb.writeln('GC events  : $gcCount');
+      sb.writeln('Delta      : ${delta >= 0 ? '+' : ''}${delta.toStringAsFixed(1)} MB');
+      sb.writeln('GC events  : ${gcEvents.length} (${rate.toStringAsFixed(1)}/sec)');
+      if (pauses.isNotEmpty) {
+        final avg = pauses.reduce((a, b) => a + b) / pauses.length;
+        final max = pauses.reduce((a, b) => a > b ? a : b);
+        sb.writeln('GC pause   : avg ${avg.toStringAsFixed(1)} ms, max ${max.toStringAsFixed(1)} ms');
+      }
       sb.writeln('');
 
+      // ponytail: rate-only thresholds; Dart's young-gen scavenges are frequent and cheap,
+      // so ~1/sec while navigating is normal. Add pause-time checks if this misfires.
+      if (rate > 5) {
+        sb.writeln('CRITICAL GC pressure: >5 GC/sec — heavy allocation in a hot path.');
+        sb.writeln('→ Avoid creating objects in build() or animation callbacks; find the function with get_cpu_hotspots.');
+      } else if (rate > 2) {
+        sb.writeln('ELEVATED GC pressure (>2/sec) — check for object creation in hot paths.');
+      }
       if (delta > 10) {
-        sb.writeln(
-            'WARNING: Heap grew ${delta.toStringAsFixed(1)} MB in ${dur}s with no user action expected.');
-        sb.writeln('→ Run find_memory_leaks for confirmation.');
-      } else if (delta > 0 && gcCount == 0) {
-        sb.writeln('Heap grew slightly with no GC — normal for active use.');
-      } else {
+        sb.writeln('Heap grew ${delta.toStringAsFixed(1)} MB in ${dur}s. → Run find_memory_leaks to confirm a leak.');
+      } else if (rate <= 2) {
         sb.writeln('Memory looks stable.');
       }
-
-      return _ok(sb.toString());
-    } catch (e) {
-      return _err(e);
-    }
-  }
-
-  Future<CallToolResult> _handleForceGc(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
-    try {
-      final before = await _service!.getMemoryUsage(_isolateId!);
-      await _service!.getAllocationProfile(_isolateId!, gc: true);
-      // Brief pause for GC to complete
-      await Future.delayed(const Duration(milliseconds: 500));
-      final after = await _service!.getMemoryUsage(_isolateId!);
-
-      final beforeMB = before.heapUsage! / 1e6;
-      final afterMB = after.heapUsage! / 1e6;
-      final freed = beforeMB - afterMB;
-
-      final sb = StringBuffer();
-      sb.writeln('GC complete.');
-      sb.writeln('Before: ${beforeMB.toStringAsFixed(1)} MB');
-      sb.writeln('After : ${afterMB.toStringAsFixed(1)} MB');
-      sb.writeln(
-          'Freed : ${freed >= 0 ? freed.toStringAsFixed(1) : '0'} MB');
-      sb.writeln('');
-
-      if (freed < 1 && afterMB > 50) {
-        sb.writeln(
-            'Heap stayed high after GC (${afterMB.toStringAsFixed(1)} MB retained).');
-        sb.writeln('→ Objects are being held. Run find_memory_leaks to identify which classes.');
-      } else {
-        sb.writeln('GC freed ${freed.toStringAsFixed(1)} MB — normal.');
-      }
-
-      return _ok(sb.toString());
-    } catch (e) {
-      return _err(e);
-    }
-  }
-
-  Future<CallToolResult> _handleMemoryDiff(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
-    try {
-      final pause = (req.arguments?['pause_seconds'] as num?)?.toInt() ?? 5;
-
-      final snap1 =
-          await _service!.getAllocationProfile(_isolateId!, gc: true);
-      await Future.delayed(Duration(seconds: pause));
-      final snap2 =
-          await _service!.getAllocationProfile(_isolateId!, gc: false);
-
-      final before = <String, int>{};
-      for (final c in snap1.members ?? []) {
-        final name = c.classRef?.name;
-        if (name != null) before[name] = c.instancesCurrent ?? 0;
-      }
-
-      final growers = <MapEntry<String, int>>[];
-      for (final c in snap2.members ?? []) {
-        final name = c.classRef?.name;
-        if (name == null) continue;
-        final delta = (c.instancesCurrent ?? 0) - (before[name] ?? 0);
-        if (delta > 0) growers.add(MapEntry(name, delta));
-      }
-
-      growers.sort((a, b) => b.value.compareTo(a.value));
-
-      final sb = StringBuffer();
-      sb.writeln('Memory Diff (${pause}s between snapshots)');
-      sb.writeln('━' * 50);
-
-      if (growers.isEmpty) {
-        sb.writeln('No class grew in instance count. No obvious leak.');
-        return _ok(sb.toString());
-      }
-
-      sb.writeln('Classes with MORE instances after ${pause}s:');
-      for (final e in growers.take(20)) {
-        final flag = e.value > 20
-            ? '  ← SUSPICIOUS'
-            : e.value > 5
-                ? '  ← elevated'
-                : '';
-        sb.writeln(
-            '  ${e.key.padRight(40)} +${e.value} instances$flag');
-      }
-
-      final suspicious = growers.where((e) => e.value > 20).toList();
-      if (suspicious.isNotEmpty) {
-        sb.writeln('');
-        sb.writeln('Investigate:');
-        for (final e in suspicious.take(5)) {
-          sb.writeln('  • ${e.key}: +${e.value} — check if navigation/dispose cleans these up');
-        }
-      }
-
       return _ok(sb.toString());
     } catch (e) {
       return _err(e);
@@ -1258,7 +1078,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
   }
 
   Future<CallToolResult> _handleFindLeaks(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final observe =
           (req.arguments?['observe_seconds'] as num?)?.toInt() ?? 5;
@@ -1269,11 +1089,11 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       final baseline =
           await _service!.getAllocationProfile(_isolateId!, gc: false);
 
-      final baselineCounts = <String, int>{};
-      for (final c in baseline.members ?? []) {
-        final name = c.classRef?.name;
-        if (name != null) baselineCounts[name] = c.instancesCurrent ?? 0;
-      }
+      // Keyed by class id: names collide across libraries (e.g. two `Color` classes)
+      final baselineCounts = {
+        for (final c in baseline.members ?? <ClassHeapStats>[])
+          if (c.classRef?.id != null) c.classRef!.id!: c.instancesCurrent ?? 0
+      };
 
       // Phase 2: observe
       await Future.delayed(Duration(seconds: observe));
@@ -1284,16 +1104,22 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       final after =
           await _service!.getAllocationProfile(_isolateId!, gc: false);
 
-      final leaks = <MapEntry<String, int>>[];
-      for (final c in after.members ?? []) {
-        final name = c.classRef?.name;
-        if (name == null) continue;
-        final delta = (c.instancesCurrent ?? 0) - (baselineCounts[name] ?? 0);
-        // Still growing after two GC cycles = strong leak signal
-        if (delta > 0) leaks.add(MapEntry(name, delta));
+      final leaks = <(String name, CodeOrigin origin, int delta)>[];
+      for (final c in after.members ?? <ClassHeapStats>[]) {
+        final before = baselineCounts[c.classRef?.id];
+        // ponytail: classes absent from the baseline are skipped — the VM omits some
+        // internal classes (Function, Namespace) from one profile and reports their whole
+        // count as growth. First-time allocation isn't a leak anyway.
+        final lib = _classLibraryUri(c);
+        // No library = VM-internal (Code, ICData, Instructions…) — JIT compiles more
+        // as you use a debug app; that growth is not a leak.
+        if (before == null || lib.isEmpty) continue;
+        final delta = (c.instancesCurrent ?? 0) - before;
+        // Still growing after two GC cycles; tiny deltas are normal churn
+        if (delta >= 5) leaks.add((c.classRef?.name ?? '?', codeOrigin(lib, _appPackage), delta));
       }
-
-      leaks.sort((a, b) => b.value.compareTo(a.value));
+      // Your classes first — they are the actionable ones
+      leaks.sort((a, b) => a.$2 != b.$2 ? a.$2.index.compareTo(b.$2.index) : b.$3.compareTo(a.$3));
 
       final sb = StringBuffer();
       sb.writeln('Leak Detection (GC → baseline → ${observe}s → GC → measure)');
@@ -1304,14 +1130,24 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
         return _ok(sb.toString());
       }
 
-      sb.writeln('Classes growing despite GC (leak candidates):');
-      for (final e in leaks.take(15)) {
-        final severity = e.value > 50
+      if (leaks.every((l) => l.$2 == CodeOrigin.sdk)) {
+        sb.writeln('No growth in your classes or dependencies — likely no leak.');
+        sb.writeln('Only framework/SDK objects grew (caches, buffers, strings — normal while the app is in use):');
+      } else {
+        sb.writeln('Classes growing despite GC (leak candidates, your code first):');
+      }
+      // Framework/SDK growth (lists, strings, caches) is usually a symptom — cap it
+      final shown = [
+        ...leaks.where((l) => l.$2 != CodeOrigin.sdk).take(15),
+        ...leaks.where((l) => l.$2 == CodeOrigin.sdk).take(5),
+      ];
+      for (final (name, origin, delta) in shown) {
+        final severity = delta > 50
             ? 'HIGH'
-            : e.value > 10
+            : delta > 10
                 ? 'MED '
                 : 'LOW ';
-        sb.writeln('  [$severity] ${e.key.padRight(40)} +${e.value} retained');
+        sb.writeln('  [$severity] ${name.padRight(40)} +$delta retained  (${origin.name})');
       }
 
       sb.writeln('');
@@ -1329,7 +1165,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
   }
 
   Future<CallToolResult> _handleClassInstances(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final className = req.arguments!['class_name'] as String;
       final profile =
@@ -1355,14 +1191,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
       for (final c in matches.take(10)) {
         final name = c.classRef?.name ?? '?';
         final inst = c.instancesCurrent ?? 0;
-        final bytes = (c.bytesCurrent ?? 0) / 1024;
-        sb.writeln(
-            '  ${name.padRight(45)} $inst instances — ${bytes.toStringAsFixed(1)} KB');
-
-        if (inst > 100) {
-          sb.writeln(
-              '    ↑ HIGH count. Check if these are being disposed correctly.');
-        }
+        sb.writeln('  ${name.padRight(45)} $inst instances — ${_fmtBytes(c.bytesCurrent ?? 0)}');
       }
 
       return _ok(sb.toString());
@@ -1371,218 +1200,94 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
     }
   }
 
-  Future<CallToolResult> _handleGcPressure(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
-    try {
-      final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
-
-      await _service!.streamListen(EventStreams.kGC);
-      final gcEvents = <Event>[];
-      final sub = _service!.onGCEvent.listen(gcEvents.add);
-
-      await Future.delayed(Duration(seconds: dur));
-      await sub.cancel();
-
-      final sb = StringBuffer();
-      sb.writeln('GC Pressure (${dur}s window)');
-      sb.writeln('━' * 50);
-
-      if (gcEvents.isEmpty) {
-        sb.writeln('0 GC events — no pressure.');
-        return _ok(sb.toString());
-      }
-
-      sb.writeln('GC events: ${gcEvents.length} in ${dur}s');
-      sb.writeln(
-          'Rate      : ${(gcEvents.length / dur).toStringAsFixed(1)} GC/sec');
-
-      // Extract pause times from event data
-      final pauses = <int>[];
-      for (final e in gcEvents) {
-        final ms = e.json?['durationMs'] as int?;
-        if (ms != null) pauses.add(ms);
-      }
-
-      if (pauses.isNotEmpty) {
-        final avg = pauses.reduce((a, b) => a + b) / pauses.length;
-        final max = pauses.reduce((a, b) => a > b ? a : b);
-        sb.writeln('Avg pause : ${avg.toStringAsFixed(1)} ms');
-        sb.writeln('Max pause : $max ms');
-      }
-
-      sb.writeln('');
-      final rate = gcEvents.length / dur;
-      if (rate > 2) {
-        sb.writeln('CRITICAL: >2 GC/sec. App allocating heavily in hot path.');
-        sb.writeln('→ Find allocation hotspots with get_cpu_hotspots.');
-        sb.writeln('→ Avoid creating objects inside build() or animation callbacks.');
-      } else if (rate > 0.5) {
-        sb.writeln('ELEVATED: frequent GC. Check for object creation in hot paths.');
-      } else {
-        sb.writeln('GC pressure NORMAL.');
-      }
-
-      return _ok(sb.toString());
-    } catch (e) {
-      return _err(e);
-    }
-  }
-
-  Future<CallToolResult> _handleMemoryBreakdown(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
-    try {
-      final mem = await _service!.getMemoryUsage(_isolateId!);
-      final vm = await _service!.getVM();
-
-      final dartHeapMB = mem.heapUsage! / 1e6;
-      final dartHeapCapMB = mem.heapCapacity! / 1e6;
-      final externalMB = mem.externalUsage! / 1e6;
-      final heapPct =
-          (dartHeapMB / dartHeapCapMB * 100).toStringAsFixed(0);
-
-      final sb = StringBuffer();
-      sb.writeln('Memory Breakdown');
-      sb.writeln('━' * 55);
-      sb.writeln('');
-      sb.writeln('Dart Heap    : ${dartHeapMB.toStringAsFixed(1)} MB used / ${dartHeapCapMB.toStringAsFixed(1)} MB capacity ($heapPct%)');
-      sb.writeln('             → Your Dart objects (widgets, models, BLoCs, lists)');
-      if (double.parse(heapPct) > 85) {
-        sb.writeln('             ⚠ NEAR CAPACITY — GC will fire frequently');
-      }
-      sb.writeln('');
-      sb.writeln('External     : ${externalMB.toStringAsFixed(1)} MB');
-      sb.writeln('             → Native memory outside Dart GC (images, platform channels, FFI)');
-      if (externalMB > 100) {
-        sb.writeln('             ⚠ HIGH — check for uncached/large images or native buffers');
-      }
-      sb.writeln('');
-
-      // RSS is not in getMemoryUsage — explain what DevTools shows
-      sb.writeln('RSS (shown in DevTools)');
-      sb.writeln('             → Total process memory including OS overhead,');
-      sb.writeln('               Flutter engine, Skia/Impeller, JIT code cache.');
-      sb.writeln('               RSS >> Dart Heap is normal (often 2-3x).');
-      sb.writeln('');
-
-      final totalKnown = dartHeapMB + externalMB;
-      sb.writeln('Raster layers: track with DevTools Memory chart (not queryable via vm_service)');
-      sb.writeln('');
-      sb.writeln('Total accountable: ${totalKnown.toStringAsFixed(1)} MB (Dart + external)');
-
-      // Isolate count
-      final isolateCount = vm.isolates?.length ?? 1;
-      if (isolateCount > 1) {
-        sb.writeln('');
-        sb.writeln('Note: $isolateCount isolates running. '
-            'This only shows the main isolate heap. '
-            'Background isolates have separate heaps.');
-      }
-
-      return _ok(sb.toString());
-    } catch (e) {
-      return _err(e);
-    }
-  }
-
-  Future<CallToolResult> _handleHttpLogging(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
-    try {
-      final enabled = req.arguments!['enabled'] as bool;
-      await _service!.callServiceExtension(
-        'ext.dart.io.httpEnableTimelineLogging',
-        isolateId: _isolateId,
-        args: {'enabled': enabled},
-      );
-      return _ok(enabled
-          ? 'HTTP logging enabled. Network requests will be captured in timeline.'
-          : 'HTTP logging disabled. Reduces memory overhead — recommended during memory profiling.');
-    } catch (e) {
-      return _err(e);
-    }
-  }
-
-  // ── Logging handlers ──────────────────────────────────────────────────────
+  static final _errorPattern = RegExp(
+      r'Error|Exception|FATAL|assert|Unhandled|══╡|crash',
+      caseSensitive: false);
 
   Future<CallToolResult> _handleWatchLogs(CallToolRequest req) async {
-    if (_service == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
+    final service = _service!, isolateId = _isolateId!;
+    final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
+    final filter = req.arguments?['filter'] as String?;
+    final errorsOnly = req.arguments?['errors_only'] == true;
+    bool? structuredWasOn;
+    final subs = <StreamSubscription>[];
     try {
-      final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
-      final filter = req.arguments?['filter'] as String?;
-
-      await _service!.streamListen(EventStreams.kStdout);
-      await _service!.streamListen(EventStreams.kStderr);
+      for (final stream in [
+        EventStreams.kStdout,
+        EventStreams.kStderr,
+        EventStreams.kLogging,
+        EventStreams.kExtension,
+      ]) {
+        await service.streamListen(stream).catchError((_) => Success());
+      }
+      // Structured errors: Flutter.Error events carry the full error text and the
+      // widget + file:line that caused it. Restored afterwards — while on, Flutter
+      // sends errors to us instead of printing them in the flutter run terminal.
+      try {
+        final r = await service.callServiceExtension(
+            'ext.flutter.inspector.structuredErrors', isolateId: isolateId);
+        structuredWasOn = '${r.json?['enabled']}' == 'true';
+        if (!structuredWasOn) {
+          await service.callServiceExtension('ext.flutter.inspector.structuredErrors',
+              isolateId: isolateId, args: {'enabled': true});
+        }
+      } catch (_) {} // profile mode: no inspector — stdout still catches errors
 
       final lines = <String>[];
-      final subs = <StreamSubscription>[];
-
-      void onEvent(Event e) {
-        final raw = e.bytes;
-        if (raw == null) return;
-        final decoded = utf8.decode(base64.decode(raw), allowMalformed: true).trim();
-        if (decoded.isEmpty) return;
-        if (filter != null && !decoded.contains(filter)) return;
-        lines.add(decoded);
+      void add(String text, {bool isError = false}) {
+        text = text.trim();
+        if (text.isEmpty) return;
+        if (errorsOnly && !isError && !_errorPattern.hasMatch(text)) return;
+        if (filter != null && !text.contains(filter)) return;
+        lines.add(text);
       }
 
-      subs.add(_service!.onStdoutEvent.listen(onEvent));
-      subs.add(_service!.onStderrEvent.listen(onEvent));
+      void onOutput(Event e) {
+        if (e.bytes != null) add(utf8.decode(base64.decode(e.bytes!), allowMalformed: true));
+      }
+
+      subs
+        ..add(service.onStdoutEvent.listen(onOutput))
+        ..add(service.onStderrEvent.listen(onOutput))
+        ..add(service.onLoggingEvent.listen((e) {
+          final r = e.logRecord;
+          if (r == null) return;
+          final level = r.level ?? 0;
+          final name = r.loggerName?.valueAsString ?? '';
+          add('[log${name.isEmpty ? '' : ':$name'}] ${r.message?.valueAsString ?? ''}'
+              '${r.error?.valueAsString == null ? '' : ' — ${r.error!.valueAsString}'}',
+              isError: level >= 1000); // SEVERE
+        }))
+        ..add(service.onExtensionEvent.listen((e) {
+          if (e.extensionKind != 'Flutter.Error') return;
+          final d = e.extensionData?.data ?? {};
+          add('══ FlutterError ══\n${d['renderedErrorText'] ?? d['description'] ?? d}',
+              isError: true);
+        }));
 
       await Future.delayed(Duration(seconds: dur));
-      for (final s in subs) await s.cancel();
 
-      if (lines.isEmpty) {
-        return _ok(
-            'No log output captured in ${dur}s${filter != null ? ' (filter: "$filter")' : ''}.');
-      }
-      return _ok(
-          'Logs (${dur}s${filter != null ? ', filter: "$filter"' : ''}):\n${'━' * 50}\n${lines.join('\n')}');
+      final what = '${errorsOnly ? 'errors' : 'output'} in ${dur}s'
+          '${filter != null ? ' (filter: "$filter")' : ''}';
+      return _ok(lines.isEmpty
+          ? 'No $what.'
+          : '${lines.length} entries — $what:\n${'━' * 50}\n${lines.join('\n')}');
     } catch (e) {
       return _err(e);
+    } finally {
+      for (final s in subs) {
+        await s.cancel();
+      }
+      if (structuredWasOn == false) {
+        await service.callServiceExtension('ext.flutter.inspector.structuredErrors',
+            isolateId: isolateId, args: {'enabled': false}).catchError((_) => Response());
+      }
     }
   }
-
-  Future<CallToolResult> _handleErrorLogs(CallToolRequest req) async {
-    if (_service == null) return _notConnected();
-    try {
-      final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
-
-      await _service!.streamListen(EventStreams.kStdout);
-      await _service!.streamListen(EventStreams.kStderr);
-
-      final errorLines = <String>[];
-      final errorPatterns = RegExp(
-          r'Error|Exception|FATAL|assert|Unhandled|FlutterError|══╡|crash',
-          caseSensitive: false);
-
-      final subs = <StreamSubscription>[];
-      void onEvent(Event e) {
-        final raw = e.bytes;
-        if (raw == null) return;
-        final decoded = utf8.decode(base64.decode(raw), allowMalformed: true).trim();
-        if (decoded.isEmpty) return;
-        if (errorPatterns.hasMatch(decoded)) errorLines.add(decoded);
-      }
-
-      subs.add(_service!.onStdoutEvent.listen(onEvent));
-      subs.add(_service!.onStderrEvent.listen(onEvent));
-
-      await Future.delayed(Duration(seconds: dur));
-      for (final s in subs) await s.cancel();
-
-      if (errorLines.isEmpty) {
-        return _ok('No errors/exceptions in ${dur}s output.');
-      }
-      return _ok(
-          'Errors found (${dur}s window):\n${'━' * 50}\n${errorLines.join('\n')}');
-    } catch (e) {
-      return _err(e);
-    }
-  }
-
-  // ── Network handlers ──────────────────────────────────────────────────────
 
   Future<CallToolResult> _handleHttpRequestBody(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final id = req.arguments!['request_id'] as String;
       final result = await _service!.getHttpProfileRequest(_isolateId!, id);
@@ -1599,7 +1304,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
         final headers = reqData.headers;
         if (headers != null && headers.isNotEmpty) {
           sb.writeln('Request headers:');
-          headers.forEach((k, v) => sb.writeln('  $k: $v'));
+          headers.forEach((k, v) => sb.writeln('  $k: ${redactHeader(k, v)}'));
           sb.writeln('');
         }
       }
@@ -1609,146 +1314,30 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
         final headers = respData.headers;
         if (headers != null && headers.isNotEmpty) {
           sb.writeln('Response headers:');
-          headers.forEach((k, v) => sb.writeln('  $k: $v'));
+          headers.forEach((k, v) => sb.writeln('  $k: ${redactHeader(k, v)}'));
           sb.writeln('');
         }
       }
 
-      return _ok(sb.toString());
-    } catch (e) {
-      return _err(e);
-    }
-  }
-
-  Future<CallToolResult> _handleWatchNetwork(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
-    try {
-      final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 5;
-      final threshold =
-          (req.arguments?['slow_threshold_ms'] as num?)?.toInt() ?? 500;
-
-      // Snapshot before
-      final before = await _service!.getHttpProfile(_isolateId!);
-      final beforeIds = before.requests.map((r) => r.id).toSet();
-
-      await Future.delayed(Duration(seconds: dur));
-
-      // Snapshot after
-      final after = await _service!.getHttpProfile(_isolateId!);
-      final newRequests =
-          after.requests.where((r) => !beforeIds.contains(r.id)).toList();
-
-      if (newRequests.isEmpty) {
-        return _ok('No new HTTP requests in ${dur}s window.');
-      }
-
-      final sb = StringBuffer();
-      sb.writeln('New HTTP requests (${dur}s window):');
-      sb.writeln('━' * 60);
-
-      for (final r in newRequests) {
-        final ms = r.endTime != null
-            ? r.endTime!.difference(r.startTime).inMilliseconds
-            : -1;
-        final msStr = ms >= 0 ? '${ms}ms' : 'pending';
-        final flag = ms > threshold
-            ? '  ← SLOW (>${threshold}ms)'
-            : ms < 0
-                ? '  ← PENDING'
-                : '';
-        final status = r.response?.statusCode?.toString() ?? '?';
-        sb.writeln(
-            '  [${r.id}] ${r.method.padRight(6)} $status  $msStr$flag');
-        sb.writeln('         ${r.uri}');
-      }
-
-      final slow = newRequests.where((r) {
-        if (r.endTime == null) return false;
-        return r.endTime!.difference(r.startTime).inMilliseconds > threshold;
-      }).length;
-
-      if (slow > 0) {
+      void body(String label, List<int>? bytes) {
+        if (bytes == null || bytes.isEmpty) return;
+        final text = redactBody(utf8.decode(bytes, allowMalformed: true));
+        sb.writeln('$label (${_fmtBytes(bytes.length)}):');
+        sb.writeln(text.length > 4000 ? '${text.substring(0, 4000)}\n… truncated' : text);
         sb.writeln('');
-        sb.writeln(
-            '$slow slow request(s) over ${threshold}ms. Use get_http_request_body with the [ID] to inspect headers.');
       }
+
+      body('Request body', result.requestBody);
+      body('Response body', result.responseBody);
 
       return _ok(sb.toString());
     } catch (e) {
       return _err(e);
     }
-  }
-
-  // ── Navigation / State handlers ───────────────────────────────────────────
-
-  Future<CallToolResult> _handleNavigationStack(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
-    try {
-      final result = await _service!.callServiceExtension(
-        'ext.flutter.navigator.getNavigatorTree',
-        isolateId: _isolateId,
-        args: {},
-      );
-
-      final data = result.json;
-      if (data == null) return _ok('No navigator data.');
-
-      final sb = StringBuffer();
-      sb.writeln('Navigation Stack:');
-      sb.writeln('━' * 50);
-
-      void writeRoutes(dynamic node, int depth) {
-        if (node == null) return;
-        final indent = '  ' * depth;
-        if (node is Map) {
-          final name = node['name']?.toString() ??
-              node['routeName']?.toString() ??
-              node['description']?.toString() ??
-              '(unnamed)';
-          sb.writeln('$indent$name');
-          final children = node['children'];
-          if (children is List) {
-            for (final c in children) writeRoutes(c, depth + 1);
-          }
-        } else if (node is List) {
-          for (final c in node) writeRoutes(c, depth);
-        }
-      }
-
-      writeRoutes(data['result'] ?? data, 0);
-
-      final depth = _countDepth(data['result'] ?? data, 0);
-      if (depth > 10) {
-        sb.writeln('');
-        sb.writeln(
-            'WARNING: Navigation stack depth $depth — possible route leak. '
-            'Ensure you pop routes and call dispose() on controllers.');
-      }
-
-      return _ok(sb.toString());
-    } catch (e) {
-      // Fallback: ext not available on all Flutter versions
-      return _ok(
-          'Navigation stack unavailable via service extension.\n'
-          'Tip: Add RouteObserver to your MaterialApp to track routes.');
-    }
-  }
-
-  int _countDepth(dynamic node, int current) {
-    if (node == null) return current;
-    if (node is Map) {
-      final children = node['children'];
-      if (children is List && children.isNotEmpty) {
-        return children
-            .map((c) => _countDepth(c, current + 1))
-            .reduce((a, b) => a > b ? a : b);
-      }
-    }
-    return current;
   }
 
   Future<CallToolResult> _handleListIsolates(CallToolRequest req) async {
-    if (_service == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final vm = await _service!.getVM();
       final isolates = vm.isolates ?? [];
@@ -1781,7 +1370,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
   // ── Eval handler ──────────────────────────────────────────────────────────
 
   Future<CallToolResult> _handleEvalExpression(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final expression = req.arguments!['expression'] as String;
       final frameIndex =
@@ -1792,7 +1381,11 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
 
       InstanceRef? result;
 
-      if (isolate.pauseEvent != null) {
+      // pauseEvent is never null — a running isolate reports kind Resume
+      final pauseKind = isolate.pauseEvent?.kind;
+      if (pauseKind == EventKind.kPauseBreakpoint ||
+          pauseKind == EventKind.kPauseException ||
+          pauseKind == EventKind.kPauseInterrupted) {
         // Isolate is paused — eval in frame context
         final frames = (await _service!.getStack(_isolateId!)).frames ?? [];
         if (frameIndex >= frames.length) {
@@ -1821,9 +1414,18 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
 
       if (result == null) return _ok('null');
 
+      // Objects have no valueAsString — ask the object itself
+      var shown = result.valueAsString;
+      if (shown == null && result.id != null) {
+        try {
+          final str = await _service!.evaluate(_isolateId!, result.id!, 'toString()');
+          if (str is InstanceRef) shown = str.valueAsString;
+        } catch (_) {}
+      }
+
       final sb = StringBuffer();
       sb.writeln('Expression: $expression');
-      sb.writeln('Result    : ${result.valueAsString ?? result.classRef?.name ?? result.kind}');
+      sb.writeln('Result    : ${shown ?? result.classRef?.name ?? result.kind}');
       if (result.valueAsStringIsTruncated == true) {
         sb.writeln('(truncated — value is larger than shown)');
       }
@@ -1831,16 +1433,14 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
 
       return _ok(sb.toString());
     } catch (e) {
-      return _err(
-          'Eval failed: $e\n'
-          'Note: For frame-context eval, pause the app first (add a breakpoint).');
+      return _err('Eval failed: $e');
     }
   }
 
   // ── App info handler ──────────────────────────────────────────────────────
 
   Future<CallToolResult> _handleAppInfo(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       final vm = await _service!.getVM();
       final ver = await _service!.getVersion();
@@ -1856,8 +1456,10 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
           isolateId: _isolateId,
           args: {},
         );
-        targetPlatform = fv.json?['value']?.toString() ?? 'unknown';
-      } catch (_) {}
+        targetPlatform = fv.json?['value']?.toString() ?? _os;
+      } catch (_) {
+        targetPlatform = _os; // platformOverride is debug-only
+      }
 
       try {
         await _service!.callServiceExtension(
@@ -1908,7 +1510,7 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
   }
 
   Future<CallToolResult> _handleScreenshot(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
       // Get root widget object ID via getRootWidgetSummaryTree
       const groupName = 'screenshot_group';
@@ -1922,15 +1524,16 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
         return _ok('Screenshot failed: could not get root widget ID. Requires debug mode.');
       }
 
-      // Use large canvas so any device/orientation fits — Flutter clips to actual render bounds
+      // Fit into 500x1000 logical px at 1x — readable, and small enough for an AI
+      // context (full-res phone PNGs were ~1.7M base64 chars)
       final result = await _service!.callServiceExtension(
         'ext.flutter.inspector.screenshot',
         isolateId: _isolateId,
         args: {
           'id': rootId,
-          'width': '2000',
-          'height': '4000',
-          'maxPixelRatio': '1.5',
+          'width': '500',
+          'height': '1000',
+          'maxPixelRatio': '1',
         },
       );
 
@@ -1955,130 +1558,67 @@ final class FlutterDevToolsMCPServer extends MCPServer with ToolsSupport {
     }
   }
 
-  Future<CallToolResult> _handleHelp(CallToolRequest req) async {
-    return _ok('''
-What problem are you solving?
-
-━ MY APP FEELS SLOW / LAGGY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  my_app_feels_slow           → Start here (auto-diagnosis, 6s)
-  capture_frame_timing        → Raw FPS + jank %
-  get_cpu_hotspots            → Which Dart functions are slow
-  get_widget_rebuild_counts   → Which widgets rebuild too often (debug mode)
-  enable_performance_overlay  → Show FPS bars on device screen
-
-━ MY APP USES TOO MUCH MEMORY ━━━━━━━━━━━━━━━━━━━━━━━━━━
-  app_uses_too_much_memory    → Start here (auto leak detection)
-  get_memory_usage            → Current heap snapshot with class breakdown
-  find_memory_leaks           → GC-confirmed leak detection
-  diff_memory_snapshots       → What grew between two snapshots
-  explain_memory_breakdown    → What RSS/heap/external mean in plain English
-
-━ I WANT TO SEE WHAT IS HAPPENING ━━━━━━━━━━━━━━━━━━━━━━
-  run_health_check            → Screenshot + FPS + memory in one call
-  take_screenshot             → See current screen as image
-  watch_logs                  → Live console output
-  get_error_logs              → Only errors/exceptions
-  watch_network               → Live HTTP requests
-  get_widget_tree             → Widget hierarchy
-
-━ I WANT TO CHANGE SOMETHING ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  hot_reload                  → Apply code changes instantly
-  toggle_visual_debug         → Widget bounds / repaint overlay
-  eval_expression             → Run Dart code in the live app
-━ SETUP ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  connect_to_app              → Connect using URI from flutter run
-  get_app_info                → App version, mode, registered extensions
-''');
-  }
-
   Future<CallToolResult> _handleHealthCheck(CallToolRequest req) async {
-    if (_service == null || _isolateId == null) return _notConnected();
-
-    final sb = StringBuffer();
-    sb.writeln('Running health check — interact with your app now...\n');
-
-    // Screenshot
-    final shot = await _handleScreenshot(req);
-
-    // Frame timing (3s)
-    final jankResult = await _handleFrameTiming(CallToolRequest(
-        name: 'capture_frame_timing', arguments: {'duration_seconds': 3}));
-
-    // Memory
-    final memResult = await _handleMemory(req);
-
-    final jankTxt = (jankResult.content.first as TextContent).text;
-    final memTxt = (memResult.content.first as TextContent).text;
-
-    // Parse key numbers
-    final fpsMatch = RegExp(r'~([\d.]+) fps').firstMatch(jankTxt);
-    final jankMatch = RegExp(r'Janky: \d+/\d+ \(([\d.]+)%\)').firstMatch(jankTxt);
-    final heapMatch = RegExp(r'([\d.]+) MB heap \((\d+)%').firstMatch(memTxt);
-
-    final fps = fpsMatch?.group(1) ?? '?';
-    final jankPct = double.tryParse(jankMatch?.group(1) ?? '0') ?? 0.0;
-    final heapPct = int.tryParse(heapMatch?.group(2) ?? '0') ?? 0;
-    final heapMb = heapMatch?.group(1) ?? '?';
-
-    final fpsStatus = jankPct < 5 ? '✓ Good' : jankPct < 20 ? '⚠ Minor jank' : '✗ Janky';
-    final memStatus = heapPct > 80 ? '⚠ High' : '✓ OK';
-
-    sb.writeln('┌─ HEALTH REPORT ────────────────────────────────────┐');
-    sb.writeln('│ FPS    : $fps fps  $fpsStatus');
-    sb.writeln('│ Jank   : ${jankPct.toStringAsFixed(1)}%  ${jankPct < 5 ? '' : '← needs attention'}');
-    sb.writeln('│ Memory : $heapMb MB (${heapPct}% of heap)  $memStatus');
-    sb.writeln('└─────────────────────────────────────────────────────┘');
-    sb.writeln('');
-
-    if (jankPct > 20) {
-      sb.writeln('SEVERE JANK detected. Run: my_app_feels_slow');
-      sb.writeln('Scroll/interact with the slow part of the app while it captures.');
-    } else if (jankPct > 5) {
-      sb.writeln('Minor jank detected. Run: get_widget_rebuild_counts (duration_seconds: 8)');
-      sb.writeln('Interact with the app during capture to find excessive rebuilds.');
-    } else if (heapPct > 80) {
-      sb.writeln('Memory pressure detected. Run: app_uses_too_much_memory');
-      sb.writeln('Use the app normally while it runs — takes ~10 seconds.');
-    } else {
-      sb.writeln('App looks healthy! If something specific feels slow, run: my_app_feels_slow');
-    }
-
-    final contents = [...shot.content, TextContent(text: sb.toString())];
-    return CallToolResult(content: contents);
-  }
-
-  Future<CallToolResult> _handleDebugFrameEvents(CallToolRequest req) async {
-    if (_service == null) return _notConnected();
+    if (!await _ensureConnected()) return _notConnected();
     try {
-      final dur = (req.arguments?['duration_seconds'] as num?)?.toInt() ?? 3;
+      // Screenshots need the debug-only inspector
+      final shot = _isDebug ? await _handleScreenshot(req) : _ok('(no screenshot in profile mode)');
+      final frames = await _jank.collectFromFrameTimings(
+          _service!, _isolateId!, const Duration(seconds: 3));
+      final mem = await _service!.getMemoryUsage(_isolateId!);
 
-      await _service!.setVMTimelineFlags(['Embedder', 'Dart', 'GC', 'API']);
-      await _service!.clearVMTimeline();
-      await Future.delayed(Duration(seconds: dur));
-      final timeline = await _service!.getVMTimeline();
+      final heapMb = mem.heapUsage! / 1e6;
+      // ponytail: fixed 500 MB threshold (heap capacity grows, so % is meaningless).
+      // Upgrade: compare against device RAM via the flutterMemoryInfo service.
+      final memHigh = heapMb > 500;
+      final enough = frames.length >= JankAnalyzer.minFrames;
+      final jankPct = frames.isEmpty
+          ? 0.0
+          : frames.where((f) => f.isJanky()).length / frames.length * 100;
 
-      final total = timeline.traceEvents?.length ?? 0;
-      if (total == 0) {
-        return _ok('No timeline events captured in ${dur}s. App may be idle.');
-      }
-
-      final names = _jank.debugEventNames(timeline);
-      final counts = _jank.debugFrameCounts(timeline);
       final sb = StringBuffer();
-      sb.writeln('Timeline: $total events in ${dur}s');
-      sb.writeln(
-          'Frame markers: UI=[Dart]Frame × ${counts['ui_async_frames']}, '
-          'Raster=[Embedder]GPURasterizer::Draw × ${counts['raster_frames']}');
-      sb.writeln('━' * 55);
-      sb.writeln('Unique event names (${names.length}):');
-      for (final n in names.take(60)) {
-        sb.writeln('  $n');
-      }
-      if (names.length > 60) sb.writeln('  ... and ${names.length - 60} more');
+      sb.writeln('┌─ HEALTH REPORT');
+      sb.writeln('│ Frames : ${_jank.verdict(frames)}');
+      sb.writeln('│ Memory : ${heapMb.toStringAsFixed(0)} MB Dart heap  ${memHigh ? '⚠ High' : '✓ OK'}');
+      sb.writeln('└${'─' * 52}');
+      sb.write(_debugCaveat());
+      sb.writeln('');
 
-      return _ok(sb.toString());
+      if (!enough) {
+        sb.writeln('Not enough frames to judge smoothness. Run analyze_jank_causes '
+            'and scroll/animate the app during the 5s capture.');
+      } else if (jankPct > 20) {
+        sb.writeln('SEVERE JANK detected. Run: analyze_jank_causes');
+        sb.writeln('Scroll/interact with the slow part of the app while it captures.');
+      } else if (jankPct > 5) {
+        sb.writeln('Minor jank detected. Run: get_widget_rebuild_counts (duration_seconds: 8)');
+        sb.writeln('Interact with the app during capture to find excessive rebuilds.');
+      } else if (memHigh) {
+        sb.writeln('Large Dart heap. Run: find_memory_leaks');
+        sb.writeln('Use the app normally while it runs — takes ~10 seconds.');
+      } else {
+        sb.writeln('App looks healthy! If something specific feels slow, run: analyze_jank_causes');
+      }
+
+      return CallToolResult(content: [...shot.content, TextContent(text: sb.toString())]);
     } catch (e) {
       return _err(e);
     }
   }
+
 }
+
+// Tool output goes to the AI provider — never forward credentials.
+final _secretHeader = RegExp(
+    r'^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|api-key)$',
+    caseSensitive: false);
+const _secretKey = r'[^"&=\s]*(?:password|passwd|secret|token|api[_-]?key)[^"&=\s]*|otp|pin';
+final _secretJson = RegExp('("(?:$_secretKey)"\\s*:\\s*)"[^"]*"', caseSensitive: false);
+final _secretForm = RegExp('(^|&)((?:$_secretKey)=)[^&]*', caseSensitive: false);
+
+Object? redactHeader(String name, Object? value) =>
+    _secretHeader.hasMatch(name) ? '[redacted]' : value;
+
+String redactBody(String body) => body
+    .replaceAllMapped(_secretJson, (m) => '${m[1]}"[redacted]"')
+    .replaceAllMapped(_secretForm, (m) => '${m[1]}${m[2]}[redacted]');

@@ -1,58 +1,105 @@
 import 'package:vm_service/vm_service.dart';
 
+enum CodeOrigin { app, dependency, sdk }
+
+/// Classifies a source URL. Handles `package:` URIs (class libraries, AOT
+/// samples) and `file:` paths (JIT CPU samples). [appPackage] is e.g.
+/// `package:my_app/`; when null, any non-SDK package counts as app code.
+CodeOrigin codeOrigin(String url, String? appPackage) {
+  if (url.isEmpty ||
+      url.startsWith('dart:') ||
+      url.contains('org-dartlang-sdk') ||
+      url.startsWith('package:flutter/') ||
+      url.startsWith('package:flutter_test/') ||
+      url.startsWith('package:sky_engine/') ||
+      url.contains('/packages/flutter/') ||
+      url.contains('/bin/cache/')) {
+    return CodeOrigin.sdk;
+  }
+  if (url.startsWith('package:')) {
+    if (appPackage == null || url.startsWith(appPackage)) return CodeOrigin.app;
+    return CodeOrigin.dependency;
+  }
+  if (url.startsWith('file:')) {
+    // ponytail: pub-cache = dependency; path/git deps outside it count as app code
+    return url.contains('/.pub-cache/') ? CodeOrigin.dependency : CodeOrigin.app;
+  }
+  return CodeOrigin.sdk; // native frames: .so / .dylib paths
+}
+
 class CpuAnalyzer {
-  String generateHotspotReport(CpuSamples samples, {int topN = 10}) {
-    final total = (samples.sampleCount ?? 0) < 1 ? 1 : samples.sampleCount!;
-    final functions = samples.functions ?? [];
+  /// Top app function and its self %, or null if none.
+  ({String name, double selfPct})? topHotspot(CpuSamples samples,
+      {String? appPackage}) {
+    final top = _functions(samples, appPackage, CodeOrigin.app, 1);
+    if (top.isEmpty) return null;
+    return (
+      name: _formatName(top.first),
+      selfPct: (top.first.exclusiveTicks ?? 0) / _total(samples) * 100,
+    );
+  }
 
-    final sorted = [...functions]
-      ..sort(
-          (a, b) => (b.exclusiveTicks ?? 0).compareTo(a.exclusiveTicks ?? 0));
+  int _total(CpuSamples s) => (s.sampleCount ?? 0) < 1 ? 1 : s.sampleCount!;
 
-    // Filter: keep only Dart user code
-    // Dart source files have resolvedUrl like "package:foo/bar.dart" or "file:///...dart"
-    // Native frames on Android have resolvedUrl like "/data/app/.../libflutter.so+0x..."
-    // Native frames on iOS have empty resolvedUrl or native lib paths
-    final user = sorted.where((f) {
-      final url = f.resolvedUrl ?? '';
-      final name = _formatName(f);
-      // Bracket notation = VM internal/native regardless of URL
-      if (name.startsWith('[')) return false;
-      // Must have a Dart source URL
-      if (url.isEmpty) return false;
-      if (!url.endsWith('.dart')) return false; // .so, .dylib, empty = not Dart
-      // Skip SDK internals
-      if (url.startsWith('dart:')) return false;
-      if (url.startsWith('org-dartlang-sdk:')) return false; // AOT compiled SDK
-      if (url.contains('org-dartlang-sdk')) return false;
-      // Skip Flutter framework (keep app code)
-      if (url.contains('packages/flutter/')) return false;
-      if (url.contains('pub.dartlang.org')) return false;
-      // Only keep app package code
-      if (!url.contains('package:') && !url.startsWith('file:')) return false;
-      return true;
-    }).take(topN).toList();
+  String generateHotspotReport(CpuSamples samples,
+      {int topN = 10, String? appPackage}) {
+    final total = _total(samples);
+    final app = _functions(samples, appPackage, CodeOrigin.app, topN);
+    final deps = _functions(samples, appPackage, CodeOrigin.dependency, 3);
+    final sdk = _functions(samples, appPackage, CodeOrigin.sdk, 3);
 
-    final windowSec =
-        ((samples.timeExtentMicros ?? 0) / 1e6).toStringAsFixed(1);
     final sb = StringBuffer();
-    sb.writeln('CPU Hotspots (${windowSec}s window, $total samples)');
+    sb.writeln('CPU Hotspots — ${samples.sampleCount ?? 0} samples');
     sb.writeln('━' * 60);
+    if ((samples.sampleCount ?? 0) < 50) {
+      sb.writeln('⚠ Only ${samples.sampleCount ?? 0} samples — the app was mostly idle. '
+          'Use the slow feature during the capture.');
+    }
+    sb.writeln('Your code${appPackage == null ? '' : ' ($appPackage)'}:');
     sb.writeln('${'Rank'.padRight(6)}${'Self%'.padRight(8)}${'Total%'.padRight(9)}Function');
+    _rows(sb, app, total);
+    if (app.isEmpty) sb.writeln('  (no samples in your code)');
+    if (deps.isNotEmpty) {
+      sb.writeln('');
+      sb.writeln('Dependencies (pub packages):');
+      _rows(sb, deps, total);
+    }
+    // Shows where time went when your code is quiet (e.g. gesture dispatch while scrolling)
+    if (sdk.isNotEmpty) {
+      sb.writeln('');
+      sb.writeln('Flutter framework / Dart SDK:');
+      _rows(sb, sdk, total);
+    }
 
-    for (int i = 0; i < user.length; i++) {
-      final f = user[i];
+    sb.writeln('');
+    sb.writeln(_advice(app, total));
+    return sb.toString();
+  }
+
+  void _rows(StringBuffer sb, List<ProfileFunction> fns, int total) {
+    for (int i = 0; i < fns.length; i++) {
+      final f = fns[i];
       final selfPct =
           ((f.exclusiveTicks ?? 0) / total * 100).toStringAsFixed(1).padLeft(5);
       final totalPct =
           ((f.inclusiveTicks ?? 0) / total * 100).toStringAsFixed(1).padLeft(6);
-      final name = _formatName(f);
-      sb.writeln('  ${(i + 1).toString().padLeft(2)}.  $selfPct%  $totalPct%  $name');
+      sb.writeln('  ${(i + 1).toString().padLeft(2)}.  $selfPct%  $totalPct%  ${_formatName(f)}');
     }
+  }
 
-    sb.writeln('');
-    sb.writeln(_advice(user, total));
-    return sb.toString();
+  List<ProfileFunction> _functions(
+      CpuSamples samples, String? appPackage, CodeOrigin origin, int topN) {
+    final sorted = [...samples.functions ?? <ProfileFunction>[]]
+      ..sort(
+          (a, b) => (b.exclusiveTicks ?? 0).compareTo(a.exclusiveTicks ?? 0));
+    return sorted.where((f) {
+      final url = f.resolvedUrl ?? '';
+      // Bracket notation = VM internal/native regardless of URL
+      if (_formatName(f).startsWith('[')) return false;
+      if ((f.inclusiveTicks ?? 0) == 0) return false; // never sampled
+      if (!url.endsWith('.dart')) return false; // .so, .dylib, empty = not Dart
+      return codeOrigin(url, appPackage) == origin;
+    }).take(topN).toList();
   }
 
   String _formatName(ProfileFunction f) {

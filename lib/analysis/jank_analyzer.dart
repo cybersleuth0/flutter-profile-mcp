@@ -15,10 +15,13 @@ class FrameData {
     required this.totalDurationMicros,
   });
 
-  // Actual CPU/GPU work — excludes vsync overhead idle time
-  int get workDurationMicros => uiDurationMicros + rasterDurationMicros;
+  // UI and raster threads are pipelined, so a frame's cost is its slower thread —
+  // summing them double-counts. Excludes vsync idle (which inflates elapsed).
+  int get workDurationMicros => uiDurationMicros > rasterDurationMicros
+      ? uiDurationMicros
+      : rasterDurationMicros;
 
-  // Jank = actual work exceeds budget, not wall time (vsync idle inflates elapsed)
+  // Same rule as DevTools: janky if either thread blew the budget
   bool isJanky({int targetFps = 60}) =>
       workDurationMicros > (1000000 ~/ targetFps);
 }
@@ -73,146 +76,7 @@ class JankAnalyzer {
     return frames;
   }
 
-  /// Fallback: parse raw timeline — use async phase ('b'/'e') for [Dart] Frame
-  /// and sync phase ('B'/'E') for [Embedder] raster events.
-  List<FrameData> parseFrames(Timeline timeline) {
-    final events = timeline.traceEvents ?? [];
-
-    final uiFrames = <_RawFrame>[];
-    final rasterFrames = <_RawFrame>[];
-    final Map<String, int> asyncBegin = {}; // async frames: key = 'name|id'
-    final Map<String, int> syncBegin = {};  // sync frames: key = 'name|tid'
-
-    for (final event in events) {
-      final raw = event.json;
-      if (raw == null) continue;
-      final name = raw['name'] as String? ?? '';
-      final ph = raw['ph'] as String? ?? '';
-      final ts = (raw['ts'] as num?)?.toInt() ?? 0;
-      final tid = raw['tid'].toString();
-      final cat = raw['cat'] as String? ?? '';
-      // Async events use 'id' for correlation, not tid
-      final id = raw['id']?.toString() ?? raw['id2']?.toString() ?? tid;
-
-      // ── UI frames ────────────────────────────────────────────────────────
-      // [Dart] Frame is async (ph='b'/'e') — TimelineTask in scheduler/binding.dart
-      if (name == 'Frame' && cat == 'Dart') {
-        if (ph == 'b') {
-          asyncBegin['frame|$id'] = ts;
-        } else if (ph == 'e') {
-          final begin = asyncBegin.remove('frame|$id');
-          if (begin != null && ts > begin) {
-            uiFrames.add(_RawFrame(begin, ts - begin));
-          }
-        }
-      }
-
-      // [Embedder] Animator::BeginFrame is sync — fallback if async Frame absent
-      if (name == 'Animator::BeginFrame' && cat == 'Embedder') {
-        if (ph == 'B') {
-          syncBegin['animbegin|$tid'] = ts;
-        } else if (ph == 'E') {
-          final begin = syncBegin.remove('animbegin|$tid');
-          if (begin != null && ts > begin) {
-            uiFrames.add(_RawFrame(begin, ts - begin));
-          }
-        }
-      }
-
-      // ── Raster frames ─────────────────────────────────────────────────────
-      // [Embedder] GPURasterizer::Draw — sync duration event on raster thread
-      if ((name == 'GPURasterizer::Draw' ||
-              name == 'CompositorContext::ScopedFrame::Raster') &&
-          cat == 'Embedder') {
-        if (ph == 'B') {
-          syncBegin['raster|$tid'] = ts;
-        } else if (ph == 'E') {
-          final begin = syncBegin.remove('raster|$tid');
-          if (begin != null && ts > begin) {
-            rasterFrames.add(_RawFrame(begin, ts - begin));
-          }
-        } else if (ph == 'X') {
-          final dur = (raw['dur'] as num?)?.toInt() ?? 0;
-          if (dur > 0) rasterFrames.add(_RawFrame(ts, dur));
-        }
-      }
-    }
-
-    if (uiFrames.isEmpty) return [];
-
-    uiFrames.sort((a, b) => a.start.compareTo(b.start));
-    rasterFrames.sort((a, b) => a.start.compareTo(b.start));
-
-    // Timestamp-based pairing: match each UI frame to nearest raster frame
-    final frames = <FrameData>[];
-    int rIdx = 0;
-
-    for (int i = 0; i < uiFrames.length; i++) {
-      final ui = uiFrames[i];
-      while (rIdx < rasterFrames.length &&
-          rasterFrames[rIdx].start < ui.start) {
-        rIdx++;
-      }
-      int rasterDur = 0;
-      if (rIdx < rasterFrames.length) {
-        final r = rasterFrames[rIdx];
-        if (r.start - ui.start < 33000) {
-          rasterDur = r.duration;
-          rIdx++;
-        }
-      }
-      final total = ui.duration > rasterDur ? ui.duration : rasterDur;
-      frames.add(FrameData(
-        frameNumber: i + 1,
-        uiStartMicros: ui.start,
-        uiDurationMicros: ui.duration,
-        rasterDurationMicros: rasterDur,
-        totalDurationMicros: total,
-      ));
-    }
-
-    return frames;
-  }
-
-  List<String> debugEventNames(Timeline timeline) {
-    final names = <String>{};
-    for (final e in timeline.traceEvents ?? []) {
-      final name = e.json?['name'] as String?;
-      final cat = e.json?['cat'] as String?;
-      final ph = e.json?['ph'] as String?;
-      if (name != null) names.add('[$cat] (ph=$ph) $name');
-    }
-    return names.toList()..sort();
-  }
-
-  Map<String, int> debugFrameCounts(Timeline timeline) {
-    int uiAsync = 0, uiSync = 0, rasterCount = 0;
-    final total = timeline.traceEvents?.length ?? 0;
-
-    for (final e in timeline.traceEvents ?? []) {
-      final raw = e.json;
-      if (raw == null) continue;
-      final name = raw['name'] as String? ?? '';
-      final cat = raw['cat'] as String? ?? '';
-      final ph = raw['ph'] as String? ?? '';
-
-      if (name == 'Frame' && cat == 'Dart' && ph == 'b') uiAsync++;
-      if (name == 'Animator::BeginFrame' && cat == 'Embedder' && ph == 'B') uiSync++;
-      if ((name == 'GPURasterizer::Draw' ||
-              name == 'CompositorContext::ScopedFrame::Raster') &&
-          cat == 'Embedder' &&
-          (ph == 'B' || ph == 'X')) rasterCount++;
-    }
-    return {
-      'total_events': total,
-      'ui_async_frames': uiAsync,   // [Dart] Frame async — primary
-      'ui_sync_frames': uiSync,     // Animator::BeginFrame sync — fallback
-      'raster_frames': rasterCount,
-    };
-  }
-
-  String generateReport(List<FrameData> frames,
-      {int targetFps = 60, bool fromFrameTimings = false}) {
+  String generateReport(List<FrameData> frames, {int targetFps = 60}) {
     if (frames.isEmpty) {
       return 'No frame data captured. Interact with the app during recording window.';
     }
@@ -223,35 +87,20 @@ class JankAnalyzer {
 
     final uiJank =
         janky.where((f) => f.uiDurationMicros > budgetMicros).length;
-    final rasterJank = janky
-        .where((f) =>
-            f.rasterDurationMicros > budgetMicros &&
-            f.uiDurationMicros <= budgetMicros)
-        .length;
+    final rasterJank =
+        janky.where((f) => f.rasterDurationMicros > budgetMicros).length;
 
     final sorted = [...frames]
       ..sort((a, b) => b.workDurationMicros.compareTo(a.workDurationMicros));
 
-    String fpsNote = '';
-    if (frames.length >= 2) {
-      final windowMicros =
-          frames.last.uiStartMicros - frames.first.uiStartMicros;
-      if (windowMicros > 0) {
-        final rawFps = (frames.length - 1) / (windowMicros / 1e6);
-        // Cap at targetFps+10 — higher values indicate stale timeline events
-        final displayFps = rawFps > targetFps + 10
-            ? targetFps.toDouble()
-            : rawFps;
-        fpsNote = ' (~${displayFps.toStringAsFixed(1)} fps)';
-      }
-    }
+    final f = fps(frames, targetFps: targetFps);
+    final fpsNote = f == null ? '' : ' (~${f.toStringAsFixed(1)} fps)';
 
-    final source = fromFrameTimings ? 'Flutter.Frame events' : 'timeline parse';
     final hasRaster = frames.any((f) => f.rasterDurationMicros > 0);
 
     final sb = StringBuffer();
     sb.writeln(
-        'Frame Analysis — ${frames.length} frames$fpsNote via $source');
+        'Frame Analysis — ${frames.length} frames$fpsNote');
     sb.writeln('Budget: ${budgetMicros ~/ 1000}ms at ${targetFps}fps');
     sb.writeln('━' * 60);
     sb.writeln(
@@ -280,12 +129,54 @@ class JankAnalyzer {
           ? ', Raster: ${(f.rasterDurationMicros / 1000).toStringAsFixed(2)}ms'
           : '';
       sb.writeln(
-          '  Frame ${f.frameNumber}: ${(f.workDurationMicros / 1000).toStringAsFixed(2)}ms work'
+          '  Frame ${f.frameNumber}: ${(f.workDurationMicros / 1000).toStringAsFixed(2)}ms slowest thread'
           ' (Build: ${(f.uiDurationMicros / 1000).toStringAsFixed(2)}ms$r)');
     }
 
     return sb.toString();
   }
+
+  /// Frames per second over the capture, or null if it can't be computed.
+  double? fps(List<FrameData> frames, {int targetFps = 60}) {
+    // Flutter only renders when something changes, so pauses between interactions
+    // aren't slow frames. Only frame-to-frame gaps under 100ms count as rendering.
+    var gaps = 0, activeMicros = 0;
+    for (var i = 1; i < frames.length; i++) {
+      final gap = frames[i].uiStartMicros - frames[i - 1].uiStartMicros;
+      if (gap > 0 && gap < 100000) {
+        gaps++;
+        activeMicros += gap;
+      }
+    }
+    if (gaps == 0) return null;
+    final rawFps = gaps / (activeMicros / 1e6);
+    // Cap at targetFps+10 — higher values indicate stale timeline events
+    return rawFps > targetFps + 10 ? targetFps.toDouble() : rawFps;
+  }
+
+  /// One-line verdict. Below [minFrames] the sample is too small to judge.
+  String verdict(List<FrameData> frames, {int targetFps = 60}) {
+    if (frames.length < minFrames) {
+      return '? INSUFFICIENT DATA — only ${frames.length} frames captured '
+          '(need $minFrames+). Interact with the app (scroll/animate) during capture.';
+    }
+    final jankPct =
+        frames.where((f) => f.isJanky(targetFps: targetFps)).length /
+            frames.length *
+            100;
+    final f = fps(frames, targetFps: targetFps) ?? targetFps.toDouble();
+    final pct = jankPct.toStringAsFixed(1);
+    final fpsStr = f.toStringAsFixed(1);
+    if (jankPct < 5 && f >= targetFps * 0.9) return '✓ HEALTHY — $pct% jank, ${fpsStr}fps';
+    if (jankPct > 20) return '✗ SEVERE JANK — $pct% frames over budget, ${fpsStr}fps';
+    if (f < targetFps * 0.8) {
+      return '⚠ LOW FPS — ${fpsStr}fps (target $targetFps). UI thread blocked between frames '
+          '(scroll listeners, timers, stream emissions)';
+    }
+    return '~ MINOR — $pct% jank, ${fpsStr}fps';
+  }
+
+  static const minFrames = 30;
 
   String _severity(int janky, int total) {
     final pct = janky / total;
@@ -294,10 +185,4 @@ class JankAnalyzer {
     if (pct < 0.30) return 'MODERATE';
     return 'SEVERE';
   }
-}
-
-class _RawFrame {
-  final int start;
-  final int duration;
-  _RawFrame(this.start, this.duration);
 }

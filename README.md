@@ -136,7 +136,7 @@ You don't need to know any tool names. Just describe the problem:
 ### Performance
 | Problem | Tool used by AI |
 |---------|----------------|
-| Is my app janky? | `my_app_feels_slow` → frames + CPU diagnosis |
+| Is my app janky? | `analyze_jank_causes` → frames + CPU diagnosis |
 | Which functions are slow? | `get_cpu_hotspots` |
 | Which widgets rebuild too often? | `get_widget_rebuild_counts` (debug mode) |
 | What does my UI look like right now? | `take_screenshot` |
@@ -146,15 +146,15 @@ You don't need to know any tool names. Just describe the problem:
 | Problem | Tool used by AI |
 |---------|----------------|
 | How much memory is my app using? | `get_memory_usage` |
-| Is something leaking? | `find_memory_leaks` / `app_uses_too_much_memory` |
-| What grew between two moments? | `diff_memory_snapshots` |
+| Is something leaking? | `find_memory_leaks` |
+| Is GC thrashing? | `get_memory_timeline` |
 
 ### Debugging
 | Problem | Tool used by AI |
 |---------|----------------|
-| Any errors in the last N seconds? | `get_error_logs` |
+| Any errors in the last N seconds? | `watch_logs` (errors_only) — includes widget file:line |
 | What's the app printing? | `watch_logs` |
-| What HTTP calls is the app making? | `watch_network` / `get_http_profile` |
+| What HTTP calls is the app making? | `get_http_profile` (watch_seconds for live) |
 | Show me the widget tree | `get_widget_tree` |
 | Apply my code changes | `hot_reload` |
 
@@ -201,7 +201,7 @@ Then point your config to the compiled binary path.
 
 `capture_frame_timing` uses Flutter's `Flutter.Frame` extension event stream — the same source as Flutter DevTools' Performance tab.
 
-**Important:** Jank is measured on `build + raster` (actual CPU/GPU work), **not** `elapsed`. The `elapsed` field includes vsync idle time (~16ms at 60fps), which would make every frame appear janky even when the app is perfectly smooth.
+**Important:** A frame is janky when its build time **or** its raster time exceeds the budget — the same rule as DevTools. The UI and raster threads run in parallel, so their times are not added. `elapsed` is not used: it includes vsync idle time (~16ms at 60fps), which would make every frame look janky.
 
 ---
 
@@ -212,7 +212,7 @@ PRs and tool ideas welcome. To add a new tool:
 1. Register in `_registerTools()` in `lib/server.dart`
 2. Add a `_handleXxx()` handler
 3. Use `_service!.callServiceExtension()` for Flutter extensions or `VmService` methods directly
-4. Return `_ok(text)` on success, `_friendlyError(e)` on failure
+4. Start with `if (!await _ensureConnected()) return _notConnected();`, return `_ok(text)` on success, `_err(e)` on failure
 
 ---
 

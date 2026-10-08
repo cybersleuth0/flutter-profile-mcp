@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.1.0
+
+- hot_reload now goes through the `reloadSources` service registered by flutter run (fixes "Error while starting Kernel isolate task")
+- analyze_jank_causes: frames + CPU captured concurrently over one window; verdict is INSUFFICIENT DATA under 30 frames and PARTIAL/INCOMPLETE when a sub-step fails; new `target_fps` param
+- Auto-reconnect to the last URI after the VM service socket drops or hot restart; clear "Disconnected" errors with adb forward check on Android
+- Picks the Flutter UI isolate instead of the first listed isolate
+- Connect errors show input and tried URI; explain SocketException's local port; fix `/ws/ws` URI conversion
+- Memory: stop reporting "% of heap capacity" as a limit (capacity grows on demand)
+- Rebuild counts: labelled as summed over instances, with per-second and per-frame rates
+- Debug-mode / Android-emulator caveat on frame verdicts
+- `auto_scroll` option (Android, via adb) on capture_frame_timing, analyze_jank_causes, get_widget_rebuild_counts
+- get_http_request_body now returns request/response bodies
+- 33 → 20 tools. Merged: get_error_logs → watch_logs (errors_only); watch_network → get_http_profile (watch_seconds);
+  watch_gc_pressure → get_memory_timeline; explain_memory_breakdown → get_memory_usage; enable_performance_overlay → toggle_visual_debug.
+  Removed: my_app_feels_slow, app_uses_too_much_memory, help (aliases), force_gc, diff_memory_snapshots (covered by find_memory_leaks),
+  debug_frame_events + raw-timeline fallback, disable_http_logging, get_navigation_stack (its Flutter extension does not exist)
+- watch_logs: captures dart:developer log() and structured Flutter errors (full text + widget file:line)
+- "Your code" vs dependencies vs framework split in CPU hotspots, memory and leak reports, based on the app's root package
+- find_memory_leaks: classes keyed by id (no more merged same-name classes), ignores VM-internal JIT objects, min growth 5
+- Jank rule fixed: a frame is janky when build OR raster exceeds the budget (DevTools rule). It used to sum them, which double-counted pipelined threads and inflated jank
+- Credentials redacted from get_http_request_body (auth headers, cookies, password/token/secret fields)
+- connect_to_app accepts DevTools links (extracts the ?uri= VM service URI)
+- FPS ignores idle gaps between interactions (no more false LOW FPS when the user pauses)
+- Rebuild shared-parent groups are per file
+- Rebuild counts skip the forced full-tree rebuild Flutter does when tracking starts (it was counted as ~1 rebuild per mounted widget on every run)
+- get_widget_tree joins single-child wrapper chains on one line, so max_depth reaches real screens (bonorx has ~150 wrappers above its first screen)
+- eval_expression shows object values via toString() (was just the type name)
+- Removed noisy heuristics: ">100 instances = HIGH" in get_class_instances; GC pressure thresholds raised to 2/5 per sec
+- CPU report warns when the app was idle (too few samples)
+- Profile mode (tested on a physical Android phone): debug-only tools say so plainly; health check skips the screenshot; CPU report adds a framework section so time spent in Flutter itself (e.g. gesture dispatch) is visible
+- eval_expression fixed: a running isolate was treated as paused, so every eval failed
+- Screenshots fit 500x1000 at 1x (~90k base64 chars instead of ~1.7M)
+- HTTP tool descriptions: package:http and Dio ARE captured (they use dart:io HttpClient)
+- Upgrade dart_mcp 0.5.x, vm_service 15.x; SDK floor 3.7
+
 ## 1.0.8
 
 - Add animated GIF demo preview to README

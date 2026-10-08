@@ -16,6 +16,10 @@ class RebuildCollector {
   // Track animation-like widgets for idle-animation detection
   final Map<String, int> _animationWidgets = {};
   StreamSubscription<Event>? _sub;
+  // Enabling trackRebuildDirtyWidgets force-rebuilds the whole tree once; that
+  // first event is every mounted widget, not real rebuilds (~675 on a real app).
+  // ponytail: assumes tracking was off before; true since we always disable after.
+  bool _skippedForcedRebuild = false;
 
   /// Pre-populate id→name from ext.flutter.inspector.widgetLocationIdMap
   /// Must call before start() so reconnect sessions have names from first event.
@@ -39,6 +43,10 @@ class RebuildCollector {
       // events = flat [id, count, id, count, ...]
       final events = data['events'];
       if (events is List && events.length >= 2) {
+        if (!_skippedForcedRebuild) {
+          _skippedForcedRebuild = true;
+          return;
+        }
         for (int i = 0; i + 1 < events.length; i += 2) {
           final id = (events[i] as num?)?.toInt();
           final count = (events[i + 1] as num?)?.toInt() ?? 1;
@@ -122,40 +130,49 @@ class RebuildCollector {
   String _shortFile(String path) =>
       path.split('/').last; // keep .dart extension for clarity
 
-  Future<String> stopAndReport() async {
+  Future<String> stopAndReport(Duration window) async {
     await _sub?.cancel();
     _sub = null;
 
     if (_counts.isEmpty) {
-      return 'No rebuild events captured.\n'
-          'Requires debug mode + Flutter Inspector active.\n'
-          'Try: flutter run (not --profile/--release)';
+      return 'No widgets rebuilt in ${window.inSeconds}s — the screen was idle.\n'
+          'Interact with the app (scroll, tap, navigate) during the capture. Needs debug mode.';
     }
 
     final sorted = _counts.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
 
+    final secs = window.inMilliseconds / 1000;
+    double perSec(int n) => secs > 0 ? n / secs : 0;
+
     final sb = StringBuffer();
-    sb.writeln('Widget Rebuild Counts:');
-    sb.writeln('━' * 55);
+    sb.writeln('Widget Rebuilds over ${secs.toStringAsFixed(0)}s');
+    sb.writeln('Count = rebuilds summed over ALL instances built at that source '
+        'line (a 50-item list rebuilt once = 50).');
+    sb.writeln('━' * 70);
+    sb.writeln('  ${'Widget (file:line)'.padRight(42)} ${'total'.padLeft(6)} ${'/sec'.padLeft(7)}');
 
     for (final e in sorted.take(20)) {
-      final flag = e.value > 50
+      final rate = perSec(e.value);
+      final flag = rate > 60
           ? '  ← EXCESSIVE'
-          : e.value > 20
+          : rate > 20
               ? '  ← HIGH'
               : '';
-      sb.writeln(
-          '  ${e.key.padRight(42)} ${e.value.toString().padLeft(5)} rebuilds$flag');
+      sb.writeln('  ${e.key.padRight(42)} ${e.value.toString().padLeft(6)} '
+          '${rate.toStringAsFixed(1).padLeft(7)}$flag');
     }
 
     // Shared-parent detection: widgets with identical counts likely share a parent
-    final countGroups = <int, List<String>>{};
+    // Grouped by (count, file) — same count in different files is coincidence
+    final countGroups = <(int, String), List<String>>{};
     for (final e in sorted.take(20)) {
-      countGroups.putIfAbsent(e.value, () => []).add(e.key);
+      final file = RegExp(r'\(([^:]+\.dart)').firstMatch(e.key)?.group(1) ?? '?';
+      countGroups.putIfAbsent((e.value, file), () => []).add(e.key);
     }
     final sharedParents = countGroups.entries
-        .where((e) => e.value.length >= 3 && e.key >= 5)
+        .where((e) => e.value.length >= 3 && e.key.$1 >= 5)
+        .map((e) => MapEntry(e.key.$1, e.value))
         .toList()
       ..sort((a, b) => b.key.compareTo(a.key));
     if (sharedParents.isNotEmpty) {
@@ -190,7 +207,7 @@ class RebuildCollector {
       }
     }
 
-    final excessive = sorted.where((e) => e.value > 50).toList();
+    final excessive = sorted.where((e) => perSec(e.value) > 60).toList();
     if (excessive.isNotEmpty) {
       sb.writeln('');
       sb.writeln('Fixes for excessive rebuilds:');

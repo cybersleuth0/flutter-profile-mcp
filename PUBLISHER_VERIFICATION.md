@@ -10,7 +10,7 @@ This repository is maintained by **cybersleuth0** and publishes packages to [pub
 - **Version**: Latest available on pub.dev
 - **GitHub Repository**: [cybersleuth0/flutter-profile-mcp](https://github.com/cybersleuth0/flutter-profile-mcp)
 - **License**: MIT
-- **Description**: MCP server for Flutter performance profiling — 27 AI-queryable tools via vm_service. Ask Claude why your app is slow.
+- **Description**: MCP server for Flutter performance profiling — AI-queryable tools via vm_service. Ask Claude why your app is slow.
 
 ## Verification Links
 
